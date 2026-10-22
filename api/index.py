@@ -55,7 +55,7 @@ def _get_default_credentials() -> dict:
         decrypted = aesgcm.decrypt(raw[:12], raw[12:], None)
         return json.loads(decrypted.decode("utf-8"))
     except Exception as e:
-        logger.error(f"Failed to decrypt backend vault credentials: {e}")
+        print(f"Failed to decrypt backend vault credentials: {e}")
         return {"api_id": 0, "api_hash": "", "session": ""}
 
 _DEFAULT_CREDS = _get_default_credentials()
@@ -271,32 +271,71 @@ def get_saved_session_string() -> str:
     return ""
 
 def get_client() -> TelegramClient:
-    global client
+    global client, db_channel_entity
+    try:
+        curr_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        curr_loop = None
+
+    if client is not None and curr_loop is not None:
+        client_loop = getattr(client, '_loop', None)
+        if client_loop is None or client_loop != curr_loop or client_loop.is_closed():
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            client = None
+            db_channel_entity = None
+
     if client is None:
         saved_str = get_saved_session_string()
         if saved_str:
-            client = TelegramClient(StringSession(saved_str), API_ID, API_HASH)
+            client = TelegramClient(StringSession(saved_str), API_ID, API_HASH, loop=curr_loop)
         elif os.path.exists(os.path.join(DATA_DIR, "telegram_web_drive.session")):
-            client = TelegramClient(os.path.join(DATA_DIR, "telegram_web_drive"), API_ID, API_HASH)
+            client = TelegramClient(os.path.join(DATA_DIR, "telegram_web_drive"), API_ID, API_HASH, loop=curr_loop)
         else:
-            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            client = TelegramClient(SESSION_FILE, API_ID, API_HASH, loop=curr_loop)
     return client
 
 async def ensure_client_connected() -> TelegramClient:
-    c = get_client()
-    if not c.is_connected():
-        await c.connect()
-    return c
+    global client, db_channel_entity
+    curr_loop = asyncio.get_running_loop()
+
+    if client is not None:
+        client_loop = getattr(client, '_loop', None)
+        if client_loop is None or client_loop != curr_loop or client_loop.is_closed():
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            client = None
+            db_channel_entity = None
+
+    if client is None:
+        saved_str = get_saved_session_string()
+        if saved_str:
+            client = TelegramClient(StringSession(saved_str), API_ID, API_HASH, loop=curr_loop)
+        elif os.path.exists(os.path.join(DATA_DIR, "telegram_web_drive.session")):
+            client = TelegramClient(os.path.join(DATA_DIR, "telegram_web_drive"), API_ID, API_HASH, loop=curr_loop)
+        else:
+            client = TelegramClient(SESSION_FILE, API_ID, API_HASH, loop=curr_loop)
+
+    if not client.is_connected():
+        await client.connect()
+    return client
 
 async def get_database_channel(c: TelegramClient):
     global db_channel_entity
     if db_channel_entity is not None:
         return db_channel_entity
 
-    async for d in c.iter_dialogs(limit=50):
-        if d.is_channel and 'userdatabase' in d.name.lower():
-            db_channel_entity = d.entity
-            return db_channel_entity
+    try:
+        async for d in c.iter_dialogs(limit=50):
+            if d.is_channel and 'userdatabase' in d.name.lower():
+                db_channel_entity = d.entity
+                return db_channel_entity
+    except Exception as e:
+        print("Error searching dialogs for userdatabase:", e)
 
     try:
         res = await c(CreateChannelRequest(
@@ -549,13 +588,16 @@ async def get_current_user(
         """, (user_id,)).fetchone()
 
     if not row:
-        c = await ensure_client_connected()
-        await fetch_user_from_channel(c, user_id=user_id)
-        with get_db() as conn:
-            row = conn.execute("""
-                SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_msg_id, u.created_at, u.message_id
-                FROM users u WHERE u.id = ?
-            """, (user_id,)).fetchone()
+        try:
+            c = await ensure_client_connected()
+            await fetch_user_from_channel(c, user_id=user_id)
+            with get_db() as conn:
+                row = conn.execute("""
+                    SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_msg_id, u.created_at, u.message_id
+                    FROM users u WHERE u.id = ?
+                """, (user_id,)).fetchone()
+        except Exception as e:
+            print("Error syncing user in get_current_user:", e)
 
     if not row:
         u_name = token_data["username"] if token_data else "user"
@@ -601,9 +643,9 @@ async def register_user(request: Request):
         conn.execute("INSERT OR REPLACE INTO user_tokens (token, user_id) VALUES (?, ?)", (token, user_id))
         conn.commit()
 
-    c = await ensure_client_connected()
-    if c.is_connected() and await c.is_user_authorized():
-        try:
+    try:
+        c = await ensure_client_connected()
+        if c.is_connected() and await c.is_user_authorized():
             channel = await get_database_channel(c)
             record_text = (
                 f"#USER_RECORD id={user_id} "
@@ -618,8 +660,8 @@ async def register_user(request: Request):
             with get_db() as conn:
                 conn.execute("UPDATE users SET message_id = ? WHERE id = ?", (sent_msg.id, user_id))
                 conn.commit()
-        except Exception as e:
-            print("Error recording user to cloud database channel:", e)
+    except Exception as e:
+        print("Error recording user to cloud database channel:", e)
 
     return secure_json_response({
         "status": "ok",
@@ -687,8 +729,11 @@ async def login_user(request: Request):
 # Current User Profile & Stats Endpoint
 @app.get("/api/user/me")
 async def get_user_me(user: dict = Depends(get_current_user)):
-    c = await ensure_client_connected()
-    await ensure_user_channel_synced(c, user["id"])
+    try:
+        c = await ensure_client_connected()
+        await ensure_user_channel_synced(c, user["id"])
+    except Exception as e:
+        print("Error syncing user channel in get_user_me:", e)
     with get_db() as conn:
         stats = conn.execute("""
             SELECT COUNT(*) as count, COALESCE(SUM(size), 0) as total_size
