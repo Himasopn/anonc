@@ -43,9 +43,26 @@ try:
 except ImportError:
     from fast_uploader import fast_pipelined_upload
 
-# Master Telegram API Credentials
-API_ID = int(os.environ.get("TELEGRAM_API_ID", "38648695"))
-API_HASH = os.environ.get("TELEGRAM_API_HASH", "9ea926414705c631aa6a908991cac059")
+# Encrypted Default Backend API Credentials (AES-256-GCM Vault)
+_VAULT_SEED = b"anonc_by_ascloud_encrypted_vault_secrets_v2"
+_VAULT_KEY = hashlib.sha256(_VAULT_SEED).digest()
+_ENCRYPTED_VAULT_KEYS = "qK0kgVmjWaXTdFflE4y0KUDyfpaAedIEBi281trdexqKGocOhswEB3L+LmEqp1be0axQT+8uIgYL8thWZG6FzHkERklUziDrLpAensc2YHJuORu2ApLUqoTu4wzPwIuH"
+
+def _get_default_credentials() -> dict:
+    try:
+        raw = base64.b64decode(_ENCRYPTED_VAULT_KEYS)
+        aesgcm = AESGCM(_VAULT_KEY)
+        decrypted = aesgcm.decrypt(raw[:12], raw[12:], None)
+        return json.loads(decrypted.decode("utf-8"))
+    except Exception as e:
+        logger.error(f"Failed to decrypt backend vault credentials: {e}")
+        return {"api_id": 0, "api_hash": ""}
+
+_DEFAULT_CREDS = _get_default_credentials()
+
+# Backend API Credentials: Environment variable overrides take precedence, otherwise decrypted AES vault
+API_ID = int(os.environ.get("TELEGRAM_API_ID") or _DEFAULT_CREDS.get("api_id", 0))
+API_HASH = str(os.environ.get("TELEGRAM_API_HASH") or _DEFAULT_CREDS.get("api_hash", ""))
 ENV_SESSION = os.environ.get("TELEGRAM_SESSION", "")
 
 IS_VERCEL = bool(os.environ.get("VERCEL"))

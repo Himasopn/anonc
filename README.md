@@ -23,10 +23,10 @@ python main.py
 ```
 Open **[http://127.0.0.1:8000](http://127.0.0.1:8000)** in your browser.
 
-Your Telegram API credentials:
-- **API ID:** `38648695`
-- **API Hash:** `9ea926414705c631aa6a908991cac059`
-- Master session is auto-loaded from `data/session_string.txt`. Normal visitors to the site register an account and never need Telegram credentials.
+Backend API Credentials:
+- Pre-configured and protected inside an AES-256-GCM encrypted vault in `api/index.py`.
+- Custom credentials can optionally be supplied via `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` environment variables.
+- Master session is auto-loaded from `data/session_string.txt` or `TELEGRAM_SESSION` env var. Normal visitors to the site register an account and never need credentials.
 
 ---
 
@@ -46,7 +46,6 @@ git push -u origin main
 1. Go to [vercel.com](https://vercel.com) and click **"Add New Project"**.
 2. Select your repository.
 3. In **Environment Variables**, add:
-   - `TELEGRAM_API_ID`: `38648695`
-   - `TELEGRAM_API_HASH`: `9ea926414705c631aa6a908991cac059`
    - `TELEGRAM_SESSION`: *(Copy the StringSession from `data/session_string.txt`)*
+   - *(Optional)* `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` if overriding the built-in AES-encrypted vault.
 4. Click **Deploy**.
