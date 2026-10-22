@@ -4,3 +4,4 @@ telethon==1.38.1
 python-multipart==0.0.20
 pyaes==1.6.1
 rsa==4.9
+cryptography>=41.0.0

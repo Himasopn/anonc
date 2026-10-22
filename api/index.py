@@ -12,6 +12,8 @@ import uuid
 import re
 import secrets
 import hashlib
+import hmac
+import base64
 import urllib.parse
 import io
 from typing import Optional, List, Dict, Any
@@ -21,8 +23,10 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Red
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, utils, helpers
 from telethon.sessions import StringSession
+from telethon.tl.types import InputFileBig, InputFile
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -31,6 +35,8 @@ from telethon.errors import (
     PasswordHashInvalidError,
     FloodWaitError,
 )
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 try:
     from api.fast_uploader import fast_pipelined_upload
@@ -55,18 +61,83 @@ DB_PATH = os.path.join(DATA_DIR, "drive.db")
 SESSION_FILE = os.path.join(DATA_DIR, "tg_session")
 STRING_SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 
-# In-memory store for active upload tasks
-upload_tasks: Dict[str, Dict[str, Any]] = {}
-db_channel_entity = None
+# 256-bit AES-GCM Key derived deterministically
+AES_KEY_HEX = hashlib.sha256(f"anonc_ascloud_aes_vault_key_{API_ID}_{API_HASH}".encode("utf-8")).hexdigest()
+AES_KEY_BYTES = bytes.fromhex(AES_KEY_HEX)
+TOKEN_SECRET = hashlib.sha256(f"{API_ID}:{API_HASH}:anonc_stateless_session_v2".encode("utf-8")).digest()
 
-# SQLite Database Initialization
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def encrypt_payload(data: Any) -> str:
+    """Encrypts any Python dict/list/string into AES-256-GCM base64 string"""
+    try:
+        aesgcm = AESGCM(AES_KEY_BYTES)
+        iv = os.urandom(12)
+        plaintext = json.dumps(data).encode("utf-8")
+        ciphertext = aesgcm.encrypt(iv, plaintext, None)
+        return base64.b64encode(iv + ciphertext).decode("utf-8")
+    except Exception as e:
+        print("AES encrypt error:", e)
+        raise HTTPException(status_code=500, detail="Encryption failed")
+
+def decrypt_payload(b64_str: str) -> Any:
+    """Decrypts an incoming AES-256-GCM base64 string into Python object"""
+    try:
+        raw = base64.b64decode(b64_str)
+        iv = raw[:12]
+        ciphertext = raw[12:]
+        aesgcm = AESGCM(AES_KEY_BYTES)
+        plaintext = aesgcm.decrypt(iv, ciphertext, None)
+        return json.loads(plaintext.decode("utf-8"))
+    except Exception as e:
+        print("AES decrypt error:", e)
+        raise HTTPException(status_code=400, detail="Failed to decrypt request payload")
+
+def secure_json_response(data: Any, status_code: int = 200) -> Response:
+    return JSONResponse(content={"e": encrypt_payload(data)}, status_code=status_code)
+
+async def parse_encrypted_body(request: Request) -> dict:
+    body = await request.body()
+    if not body:
+        return {}
+    try:
+        obj = json.loads(body.decode("utf-8"))
+        if isinstance(obj, dict) and "e" in obj:
+            return decrypt_payload(obj["e"])
+        return obj
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request payload")
+
+def create_user_token(user_id: str, username: str) -> str:
+    ts = int(time.time())
+    payload = f"{user_id}:{username}:{ts}"
+    sig = hmac.new(TOKEN_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode("utf-8")).decode("utf-8")
+
+def verify_user_token(token_str: str) -> Optional[dict]:
+    if not token_str:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token_str.encode("utf-8")).decode("utf-8")
+        parts = raw.split(":")
+        if len(parts) != 4:
+            return None
+        u_id, u_name, ts_str, sig = parts
+        payload = f"{u_id}:{u_name}:{ts_str}"
+        expected_sig = hmac.new(TOKEN_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        if time.time() - int(ts_str) > 60 * 86400:
+            return None
+        return {"id": u_id, "username": u_name}
+    except Exception:
+        return None
+
+# Database Initialization
+_db_initialized = False
 
 def init_db():
-    with get_db() as conn:
+    global _db_initialized
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
@@ -82,7 +153,6 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Schema migration for existing users table
         user_cols = [c[1] for c in conn.execute("PRAGMA table_info(users)").fetchall()]
         if "display_name" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT NULL;")
@@ -135,6 +205,14 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_folders_user_id ON folders(user_id);")
         conn.commit()
+    _db_initialized = True
+
+def get_db():
+    if not _db_initialized or not os.path.exists(DB_PATH):
+        init_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 init_db()
 
@@ -149,6 +227,8 @@ app.add_middleware(
 )
 
 client: Optional[TelegramClient] = None
+db_channel_entity = None
+upload_tasks: Dict[str, Dict[str, Any]] = {}
 
 def get_saved_session_string() -> str:
     if ENV_SESSION:
@@ -173,18 +253,22 @@ def get_client() -> TelegramClient:
             client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     return client
 
+async def ensure_client_connected() -> TelegramClient:
+    c = get_client()
+    if not c.is_connected():
+        await c.connect()
+    return c
+
 async def get_database_channel(c: TelegramClient):
     global db_channel_entity
     if db_channel_entity is not None:
         return db_channel_entity
-    
-    # Try finding existing 'userdatabase' channel
+
     async for d in c.iter_dialogs(limit=50):
         if d.is_channel and 'userdatabase' in d.name.lower():
             db_channel_entity = d.entity
             return db_channel_entity
-            
-    # Create channel if not existing
+
     try:
         res = await c(CreateChannelRequest(
             title='userdatabase',
@@ -197,12 +281,89 @@ async def get_database_channel(c: TelegramClient):
         print("Error getting/creating userdatabase channel:", e)
         return "me"
 
-# Sync user accounts and files from cloud channel into local SQLite
+# Channel-to-SQLite On-Demand Sync Helpers
+async def fetch_user_from_channel(c: TelegramClient, user_id: Optional[str] = None, username: Optional[str] = None) -> Optional[dict]:
+    try:
+        channel = await get_database_channel(c)
+        async for msg in c.iter_messages(channel, limit=300):
+            text = msg.text or ""
+            if text.startswith("#USER_RECORD ") or text.startswith("#USER_REGISTER "):
+                parts = dict(re.findall(r'(\w+)=([^\s]+)', text.split("\n")[0]))
+                u_id = parts.get("id")
+                u_name = parts.get("username")
+                if (user_id and u_id == user_id) or (username and u_name and u_name.lower() == username.lower()):
+                    pwd_hash = parts.get("hash", "")
+                    salt = parts.get("salt", "")
+                    d_name = urllib.parse.unquote(parts.get("display", "")) or u_name
+                    color = urllib.parse.unquote(parts.get("color", "#0A84FF"))
+                    avatar_val = parts.get("avatar")
+                    avatar_msg = int(avatar_val) if (avatar_val and avatar_val not in ("None", "null", "")) else None
+                    settings_str = urllib.parse.unquote(parts.get("settings", "{}"))
+                    with get_db() as conn:
+                        conn.execute("""
+                            INSERT INTO users (id, username, display_name, password_hash, salt, avatar_color, avatar_msg_id, settings_json, message_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                                username = excluded.username,
+                                display_name = COALESCE(excluded.display_name, users.display_name),
+                                password_hash = excluded.password_hash,
+                                salt = excluded.salt,
+                                avatar_color = excluded.avatar_color,
+                                avatar_msg_id = COALESCE(excluded.avatar_msg_id, users.avatar_msg_id),
+                                settings_json = excluded.settings_json,
+                                message_id = excluded.message_id
+                        """, (u_id, u_name, d_name, pwd_hash, salt, color, avatar_msg, settings_str, msg.id))
+                        conn.commit()
+                    return {"id": u_id, "username": u_name, "display_name": d_name, "avatar_color": color, "avatar_msg_id": avatar_msg, "password_hash": pwd_hash, "salt": salt, "settings_json": settings_str}
+    except Exception as e:
+        print("fetch_user_from_channel error:", e)
+    return None
+
+async def ensure_user_channel_synced(c: TelegramClient, user_id: str):
+    with get_db() as conn:
+        f_count = conn.execute("SELECT COUNT(*) FROM files WHERE user_id = ?", (user_id,)).fetchone()[0]
+        fold_count = conn.execute("SELECT COUNT(*) FROM folders WHERE user_id = ?", (user_id,)).fetchone()[0]
+
+    if f_count == 0 and fold_count == 0:
+        try:
+            channel = await get_database_channel(c)
+            with get_db() as conn:
+                async for msg in c.iter_messages(channel, limit=300):
+                    text = msg.text or ""
+                    if text.startswith("#USER_FOLDER ") and f"user_id={user_id}" in text:
+                        parts = dict(re.findall(r'(\w+)=([^\s]+)', text))
+                        parent_id = parts.get("parent_id")
+                        if parent_id in ("None", "root"):
+                            parent_id = None
+                        conn.execute("""
+                            INSERT OR IGNORE INTO folders (id, user_id, name, parent_id, created_at)
+                            VALUES (?, ?, ?, ?, datetime('now'))
+                        """, (parts["id"], user_id, parts.get("name", "Folder"), parent_id))
+                    elif text.startswith("#USER_FILE ") and f"user_id={user_id}" in text and msg.media:
+                        parts = dict(re.findall(r'(\w+)=([^\s]+)', text.split("\n")[0]))
+                        folder_id = parts.get("folder_id")
+                        if folder_id in ("None", "root"):
+                            folder_id = None
+                        f_mime = (msg.file.mime_type if msg.file else None) or "application/octet-stream"
+                        m_type = "document"
+                        if f_mime.startswith("video/"): m_type = "video"
+                        elif f_mime.startswith("audio/"): m_type = "audio"
+                        elif f_mime.startswith("image/"): m_type = "image"
+                        f_name = (msg.file.name if msg.file else None) or (text.split("\n", 1)[1] if "\n" in text else "file")
+                        f_size = msg.file.size if msg.file else 0
+                        conn.execute("""
+                            INSERT OR IGNORE INTO files (user_id, message_id, folder_id, name, size, mime_type, media_type, date)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (user_id, msg.id, folder_id, f_name, f_size, f_mime, m_type, str(msg.date)))
+                conn.commit()
+        except Exception as e:
+            print("ensure_user_channel_synced error:", e)
+
 async def sync_channel_database(c: TelegramClient):
     try:
         channel = await get_database_channel(c)
         with get_db() as conn:
-            async for msg in c.iter_messages(channel, limit=1000):
+            async for msg in c.iter_messages(channel, limit=500):
                 text = msg.text or ""
                 if text.startswith("#USER_RECORD ") or text.startswith("#USER_REGISTER "):
                     parts = dict(re.findall(r'(\w+)=([^\s]+)', text.split("\n")[0]))
@@ -238,8 +399,7 @@ async def sync_channel_database(c: TelegramClient):
                     parts = dict(re.findall(r'(\w+)=([^\s]+)', text))
                     if "id" in parts and "user_id" in parts and "name" in parts:
                         parent_id = parts.get("parent_id")
-                        if parent_id == "None":
-                            parent_id = None
+                        if parent_id == "None": parent_id = None
                         conn.execute("""
                             INSERT OR IGNORE INTO folders (id, user_id, name, parent_id, created_at)
                             VALUES (?, ?, ?, ?, datetime('now'))
@@ -249,25 +409,19 @@ async def sync_channel_database(c: TelegramClient):
                     if "user_id" in parts and msg.media:
                         u_id = parts["user_id"]
                         f_id = parts.get("folder_id")
-                        if f_id in ("root", "None"):
-                            f_id = None
+                        if f_id in ("root", "None"): f_id = None
                         f_mime = (msg.file.mime_type if msg.file else None) or "application/octet-stream"
                         m_type = "document"
-                        if f_mime.startswith("video/"):
-                            m_type = "video"
-                        elif f_mime.startswith("audio/"):
-                            m_type = "audio"
-                        elif f_mime.startswith("image/"):
-                            m_type = "image"
+                        if f_mime.startswith("video/"): m_type = "video"
+                        elif f_mime.startswith("audio/"): m_type = "audio"
+                        elif f_mime.startswith("image/"): m_type = "image"
                         f_name = (msg.file.name if msg.file else None) or (text.split("\n", 1)[1] if "\n" in text else "file")
                         f_size = msg.file.size if msg.file else 0
-                        date_str = str(msg.date)
                         conn.execute("""
                             INSERT OR IGNORE INTO files (user_id, message_id, folder_id, name, size, mime_type, media_type, date)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (u_id, msg.id, f_id, f_name, f_size, f_mime, m_type, date_str))
+                        """, (u_id, msg.id, f_id, f_name, f_size, f_mime, m_type, str(msg.date)))
             conn.commit()
-        print("Synced users, folders, and files from Telegram channel database.")
     except Exception as e:
         print("Sync channel database error:", e)
 
@@ -298,16 +452,10 @@ def format_size(size_bytes: int) -> str:
     s = round(size_bytes / p, 2)
     return f"{s} {units[i]}"
 
-# Password Hashing with PBKDF2-HMAC-SHA256
 def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
     if not salt:
         salt = secrets.token_hex(16)
-    key = hashlib.pbkdf2_hmac(
-        'sha256',
-        password.encode('utf-8'),
-        salt.encode('utf-8'),
-        100000
-    )
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000)
     return key.hex(), salt
 
 def verify_password(password: str, salt: str, expected_hash: str) -> bool:
@@ -317,55 +465,65 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 # Authentication Dependency: Returns current user or raises 401
 async def get_current_user(
     authorization: Optional[str] = Header(None),
-    x_auth_token: Optional[str] = Header(None)
+    x_auth_token: Optional[str] = Header(None),
+    token: Optional[str] = Query(None)
 ):
-    token = None
+    raw_token = None
     if authorization and authorization.startswith("Bearer "):
-        token = authorization.split("Bearer ")[1].strip()
+        raw_token = authorization.split("Bearer ")[1].strip()
     elif x_auth_token:
-        token = x_auth_token.strip()
+        raw_token = x_auth_token.strip()
+    elif token:
+        raw_token = token.strip()
 
-    if not token:
+    if not raw_token:
         raise HTTPException(status_code=401, detail="Authentication required")
+
+    token_data = verify_user_token(raw_token)
+    user_id = token_data["id"] if token_data else None
+
+    if not user_id:
+        with get_db() as conn:
+            t_row = conn.execute("SELECT user_id FROM user_tokens WHERE token = ?", (raw_token,)).fetchone()
+            if t_row:
+                user_id = t_row["user_id"]
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
 
     with get_db() as conn:
         row = conn.execute("""
             SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_msg_id, u.created_at, u.message_id
-            FROM user_tokens t
-            JOIN users u ON t.user_id = u.id
-            WHERE t.token = ?
-        """, (token,)).fetchone()
+            FROM users u WHERE u.id = ?
+        """, (user_id,)).fetchone()
 
-        if not row:
-            raise HTTPException(status_code=401, detail="Invalid or expired session")
-        return dict(row)
+    if not row:
+        c = await ensure_client_connected()
+        await fetch_user_from_channel(c, user_id=user_id)
+        with get_db() as conn:
+            row = conn.execute("""
+                SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_msg_id, u.created_at, u.message_id
+                FROM users u WHERE u.id = ?
+            """, (user_id,)).fetchone()
 
-# Request Models
-class UserRegisterRequest(BaseModel):
-    username: str
-    password: str
+    if not row:
+        u_name = token_data["username"] if token_data else "user"
+        with get_db() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO users (id, username, display_name, password_hash, salt)
+                VALUES (?, ?, ?, 'cached', 'cached')
+            """, (user_id, u_name, u_name))
+            conn.commit()
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
-class UserLoginRequest(BaseModel):
-    username: str
-    password: str
-
-class UpdateSettingsRequest(BaseModel):
-    display_name: Optional[str] = None
-    username: Optional[str] = None
-    avatar_color: Optional[str] = None
-    current_password: Optional[str] = None
-    new_password: Optional[str] = None
-    settings: Optional[Dict[str, Any]] = None
-
-class CreateFolderRequest(BaseModel):
-    name: str
-    parent_id: Optional[str] = None
+    return dict(row)
 
 # User Registration Endpoint
 @app.post("/api/user/register")
-async def register_user(req: UserRegisterRequest):
-    username = req.username.strip().lower()
-    password = req.password.strip()
+async def register_user(request: Request):
+    payload = await parse_encrypted_body(request)
+    username = payload.get("username", "").strip().lower()
+    password = payload.get("password", "").strip()
 
     if not re.match(r'^[a-zA-Z0-9_]{3,30}$', username):
         raise HTTPException(status_code=400, detail="Username must be 3-30 letters/numbers.")
@@ -388,12 +546,11 @@ async def register_user(req: UserRegisterRequest):
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (user_id, username, display_name, pwd_hash, salt, avatar_color, settings_json))
 
-        token = secrets.token_hex(32)
-        conn.execute("INSERT INTO user_tokens (token, user_id) VALUES (?, ?)", (token, user_id))
+        token = create_user_token(user_id, username)
+        conn.execute("INSERT OR REPLACE INTO user_tokens (token, user_id) VALUES (?, ?)", (token, user_id))
         conn.commit()
 
-    # Log user record to cloud database channel
-    c = get_client()
+    c = await ensure_client_connected()
     if c.is_connected() and await c.is_user_authorized():
         try:
             channel = await get_database_channel(c)
@@ -413,7 +570,7 @@ async def register_user(req: UserRegisterRequest):
         except Exception as e:
             print("Error recording user to cloud database channel:", e)
 
-    return {
+    return secure_json_response({
         "status": "ok",
         "token": token,
         "user": {
@@ -425,24 +582,33 @@ async def register_user(req: UserRegisterRequest):
             "avatar_msg_id": None,
             "settings": {"auto_preview": True, "fast_seek": True}
         }
-    }
+    })
 
 # User Login Endpoint
 @app.post("/api/user/login")
-async def login_user(req: UserLoginRequest):
-    username = req.username.strip().lower()
-    password = req.password.strip()
+async def login_user(request: Request):
+    payload = await parse_encrypted_body(request)
+    username = payload.get("username", "").strip().lower()
+    password = payload.get("password", "").strip()
 
     with get_db() as conn:
         user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-        if not user:
-            raise HTTPException(status_code=400, detail="Invalid username or password.")
 
-        if not verify_password(password, user["salt"], user["password_hash"]):
-            raise HTTPException(status_code=400, detail="Invalid username or password.")
+    if not user:
+        c = await ensure_client_connected()
+        await fetch_user_from_channel(c, username=username)
+        with get_db() as conn:
+            user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
 
-        token = secrets.token_hex(32)
-        conn.execute("INSERT INTO user_tokens (token, user_id) VALUES (?, ?)", (token, user["id"]))
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid username or password.")
+
+    if not verify_password(password, user["salt"], user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Invalid username or password.")
+
+    token = create_user_token(user["id"], user["username"])
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO user_tokens (token, user_id) VALUES (?, ?)", (token, user["id"]))
         conn.commit()
 
         settings_dict = {"auto_preview": True, "fast_seek": True}
@@ -453,7 +619,7 @@ async def login_user(req: UserLoginRequest):
                 pass
 
     avatar_msg = user["avatar_msg_id"] if "avatar_msg_id" in user.keys() else None
-    return {
+    return secure_json_response({
         "status": "ok",
         "token": token,
         "user": {
@@ -465,11 +631,13 @@ async def login_user(req: UserLoginRequest):
             "avatar_msg_id": avatar_msg,
             "settings": settings_dict
         }
-    }
+    })
 
 # Current User Profile & Stats Endpoint
 @app.get("/api/user/me")
 async def get_user_me(user: dict = Depends(get_current_user)):
+    c = await ensure_client_connected()
+    await ensure_user_channel_synced(c, user["id"])
     with get_db() as conn:
         stats = conn.execute("""
             SELECT COUNT(*) as count, COALESCE(SUM(size), 0) as total_size
@@ -486,7 +654,7 @@ async def get_user_me(user: dict = Depends(get_current_user)):
             pass
 
     avatar_msg = user_row["avatar_msg_id"] if user_row and "avatar_msg_id" in user_row.keys() else None
-    return {
+    return secure_json_response({
         "user": {
             "id": user["id"],
             "username": user_row["username"] if user_row else user["username"],
@@ -503,11 +671,12 @@ async def get_user_me(user: dict = Depends(get_current_user)):
             "total_bytes": stats["total_size"] if stats else 0,
             "total_formatted": format_size(stats["total_size"] if stats else 0)
         }
-    }
+    })
 
 # Update User Settings & Sync with Cloud Database Channel
 @app.post("/api/user/settings")
-async def update_user_settings(req: UpdateSettingsRequest, user: dict = Depends(get_current_user)):
+async def update_user_settings(request: Request, user: dict = Depends(get_current_user)):
+    payload = await parse_encrypted_body(request)
     user_id = user["id"]
     with get_db() as conn:
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -529,10 +698,10 @@ async def update_user_settings(req: UpdateSettingsRequest, user: dict = Depends(
             except Exception:
                 pass
 
-        # Update username if requested
         new_username = curr_username
-        if req.username and req.username.strip().lower() != curr_username:
-            new_u = req.username.strip().lower()
+        req_username = payload.get("username")
+        if req_username and req_username.strip().lower() != curr_username:
+            new_u = req_username.strip().lower()
             if not re.match(r'^[a-zA-Z0-9_]{3,30}$', new_u):
                 raise HTTPException(status_code=400, detail="Username must be 3-30 letters/numbers.")
             taken = conn.execute("SELECT id FROM users WHERE username = ? AND id != ?", (new_u, user_id)).fetchone()
@@ -540,43 +709,35 @@ async def update_user_settings(req: UpdateSettingsRequest, user: dict = Depends(
                 raise HTTPException(status_code=400, detail="Username is already taken.")
             new_username = new_u
 
-        # Update display name
         new_display = curr_display
-        if req.display_name is not None:
-            new_display = req.display_name.strip()[:50] or new_username
+        if "display_name" in payload and payload["display_name"] is not None:
+            new_display = payload["display_name"].strip()[:50] or new_username
 
-        # Update avatar color
-        new_color = curr_color
-        if req.avatar_color:
-            new_color = req.avatar_color.strip()
-
-        # Update password if requested
         new_hash = curr_hash
         new_salt = curr_salt
-        if req.new_password:
-            if not req.current_password:
+        if "new_password" in payload and payload["new_password"]:
+            curr_pass = payload.get("current_password", "").strip()
+            if not curr_pass:
                 raise HTTPException(status_code=400, detail="Current password is required to change password.")
-            if not verify_password(req.current_password.strip(), curr_salt, curr_hash):
+            if not verify_password(curr_pass, curr_salt, curr_hash):
                 raise HTTPException(status_code=400, detail="Incorrect current password.")
-            if len(req.new_password.strip()) < 4:
+            new_p = payload["new_password"].strip()
+            if len(new_p) < 4:
                 raise HTTPException(status_code=400, detail="New password must be at least 4 characters.")
-            new_hash, new_salt = hash_password(req.new_password.strip())
+            new_hash, new_salt = hash_password(new_p)
 
-        # Update preferences
-        if req.settings is not None:
-            curr_settings.update(req.settings)
+        if "settings" in payload and payload["settings"] is not None:
+            curr_settings.update(payload["settings"])
 
         settings_json = json.dumps(curr_settings)
-
         conn.execute("""
             UPDATE users 
-            SET username = ?, display_name = ?, avatar_color = ?, password_hash = ?, salt = ?, settings_json = ?, updated_at = datetime('now')
+            SET username = ?, display_name = ?, password_hash = ?, salt = ?, settings_json = ?, updated_at = datetime('now')
             WHERE id = ?
-        """, (new_username, new_display, new_color, new_hash, new_salt, settings_json, user_id))
+        """, (new_username, new_display, new_hash, new_salt, settings_json, user_id))
         conn.commit()
 
-    # Edit user record on cloud database channel
-    c = get_client()
+    c = await ensure_client_connected()
     if c.is_connected() and await c.is_user_authorized():
         try:
             channel = await get_database_channel(c)
@@ -584,28 +745,18 @@ async def update_user_settings(req: UpdateSettingsRequest, user: dict = Depends(
                 f"#USER_RECORD id={user_id} "
                 f"username={new_username} "
                 f"display={urllib.parse.quote(new_display)} "
-                f"color={urllib.parse.quote(new_color)} "
+                f"color={urllib.parse.quote(curr_color)} "
                 f"avatar={curr_avatar_msg} "
                 f"salt={new_salt} "
                 f"hash={new_hash} "
                 f"settings={urllib.parse.quote(settings_json)} "
                 f"updated={int(time.time())}"
             )
-
             msg_to_edit = curr_msg_id
-            if not msg_to_edit:
-                async for m in c.iter_messages(channel, limit=1000):
-                    t = m.text or ""
-                    if t.startswith("#USER_") and f"id={user_id}" in t:
-                        msg_to_edit = m.id
-                        break
-
             if msg_to_edit:
                 try:
                     await c.edit_message(channel, msg_to_edit, record_text)
-                    print(f"Edited user {user_id} cloud record in database channel (msg {msg_to_edit}).")
-                except Exception as edit_err:
-                    print("Error editing channel message, sending update:", edit_err)
+                except Exception:
                     sent = await c.send_message(channel, record_text)
                     msg_to_edit = sent.id
             else:
@@ -615,23 +766,22 @@ async def update_user_settings(req: UpdateSettingsRequest, user: dict = Depends(
             with get_db() as conn:
                 conn.execute("UPDATE users SET message_id = ? WHERE id = ?", (msg_to_edit, user_id))
                 conn.commit()
-
         except Exception as e:
             print("Error updating user record on cloud channel:", e)
 
-    return {
+    return secure_json_response({
         "status": "ok",
         "message": "User settings updated and synchronized to cloud.",
         "user": {
             "id": user_id,
             "username": new_username,
             "display_name": new_display,
-            "avatar_color": new_color,
+            "avatar_color": curr_color,
             "avatar_url": f"/api/user/avatar/{user_id}?v={curr_avatar_msg}" if curr_avatar_msg else None,
             "avatar_msg_id": curr_avatar_msg,
             "settings": curr_settings
         }
-    }
+    })
 
 # User Logout Endpoint
 @app.post("/api/user/logout")
@@ -649,9 +799,8 @@ async def logout_user(
         with get_db() as conn:
             conn.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
             conn.commit()
-    return {"status": "ok"}
+    return secure_json_response({"status": "ok"})
 
-# Helper to generate SVG avatar fallback
 def generate_svg_avatar(letter: str, bg_color: str = "#0A84FF") -> bytes:
     clean_letter = (letter or "U")[0].upper()
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
@@ -666,7 +815,6 @@ def generate_svg_avatar(letter: str, bg_color: str = "#0A84FF") -> bytes:
 </svg>"""
     return svg.encode("utf-8")
 
-# Endpoint: Serve User Avatar from Cloud Database Channel
 @app.get("/api/user/avatar/{user_id}")
 async def get_user_avatar(user_id: str):
     with get_db() as conn:
@@ -686,10 +834,7 @@ async def get_user_avatar(user_id: str):
             headers={"Cache-Control": "public, max-age=86400"}
         )
 
-    c = get_client()
-    if not c.is_connected():
-        await c.connect()
-
+    c = await ensure_client_connected()
     try:
         channel = await get_database_channel(c)
         msg = await c.get_messages(channel, ids=row["avatar_msg_id"])
@@ -728,7 +873,6 @@ async def get_user_avatar(user_id: str):
             headers={"Cache-Control": "no-cache"}
         )
 
-# Endpoint: Upload new Profile Picture (PFP) directly to Cloud Database Channel
 @app.post("/api/user/avatar")
 async def upload_user_avatar(
     avatar: UploadFile = File(...),
@@ -743,17 +887,11 @@ async def upload_user_avatar(
         raise HTTPException(status_code=400, detail="Avatar image size must be under 5MB.")
 
     ext = ".jpg"
-    if "png" in content_type:
-        ext = ".png"
-    elif "webp" in content_type:
-        ext = ".webp"
-    elif "gif" in content_type:
-        ext = ".gif"
+    if "png" in content_type: ext = ".png"
+    elif "webp" in content_type: ext = ".webp"
+    elif "gif" in content_type: ext = ".gif"
 
-    c = get_client()
-    if not c.is_connected():
-        await c.connect()
-
+    c = await ensure_client_connected()
     channel = await get_database_channel(c)
     file_obj = io.BytesIO(img_bytes)
     file_obj.name = f"avatar_{user_id}{ext}"
@@ -772,7 +910,6 @@ async def upload_user_avatar(
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         conn.commit()
 
-    # Sync #USER_RECORD in cloud channel
     try:
         record_msg_id = user_row["message_id"]
         record_text = (
@@ -794,14 +931,13 @@ async def upload_user_avatar(
     except Exception as e:
         print("Error syncing user record with avatar update:", e)
 
-    return {
+    return secure_json_response({
         "status": "ok",
         "avatar_url": f"/api/user/avatar/{user_id}?v={avatar_msg_id}",
         "avatar_msg_id": avatar_msg_id,
         "message": "Profile photo uploaded and synchronized to cloud."
-    }
+    })
 
-# Endpoint: Remove Profile Picture (reverts to default avatar)
 @app.delete("/api/user/avatar")
 async def delete_user_avatar(user: dict = Depends(get_current_user)):
     user_id = user["id"]
@@ -810,11 +946,10 @@ async def delete_user_avatar(user: dict = Depends(get_current_user)):
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         conn.commit()
 
-    c = get_client()
+    c = await ensure_client_connected()
     if c.is_connected() and await c.is_user_authorized():
         try:
             channel = await get_database_channel(c)
-            record_msg_id = user_row["message_id"]
             record_text = (
                 f"#USER_RECORD id={user_id} "
                 f"username={user_row['username']} "
@@ -834,17 +969,19 @@ async def delete_user_avatar(user: dict = Depends(get_current_user)):
         except Exception as e:
             print("Error syncing user record with avatar removal:", e)
 
-    return {
+    return secure_json_response({
         "status": "ok",
         "avatar_url": None,
         "avatar_msg_id": None,
         "message": "Profile photo removed."
-    }
+    })
 
 # Per-User Folders API
 @app.get("/api/folders")
 async def list_folders(parent_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     user_id = user["id"]
+    c = await ensure_client_connected()
+    await ensure_user_channel_synced(c, user_id)
     with get_db() as conn:
         if parent_id and parent_id != "root":
             cur = conn.execute("SELECT * FROM folders WHERE user_id = ? AND parent_id = ? ORDER BY name ASC", (user_id, parent_id))
@@ -867,42 +1004,56 @@ async def list_folders(parent_id: Optional[str] = None, user: dict = Depends(get
             else:
                 break
 
-    return {"folders": folders, "breadcrumbs": breadcrumbs}
+    return secure_json_response({"folders": folders, "breadcrumbs": breadcrumbs})
 
 @app.post("/api/folders")
-async def create_folder(req: CreateFolderRequest, user: dict = Depends(get_current_user)):
-    folder_name = req.name.strip()
+async def create_folder(request: Request, user: dict = Depends(get_current_user)):
+    payload = await parse_encrypted_body(request)
+    folder_name = payload.get("name", "").strip()
     if not folder_name:
         raise HTTPException(status_code=400, detail="Folder name is required")
-    parent_id = req.parent_id if (req.parent_id and req.parent_id != "root") else None
+    parent_id = payload.get("parent_id")
+    if parent_id in ("root", "None", ""): parent_id = None
     user_id = user["id"]
 
     clean_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', folder_name).lower()
-    folder_id = f"f_{clean_slug}_{os.urandom(3).hex()}"
+    folder_id = f"f_{clean_slug[:15]}_{uuid.uuid4().hex[:6]}"
 
     with get_db() as conn:
-        conn.execute("INSERT INTO folders (id, user_id, name, parent_id) VALUES (?, ?, ?, ?)", (folder_id, user_id, folder_name, parent_id))
+        conn.execute("""
+            INSERT INTO folders (id, user_id, name, parent_id, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+        """, (folder_id, user_id, folder_name, parent_id))
         conn.commit()
 
-    # Log folder to Telegram channel
-    c = get_client()
+    c = await ensure_client_connected()
     if c.is_connected() and await c.is_user_authorized():
         try:
             channel = await get_database_channel(c)
-            await c.send_message(channel, f"#USER_FOLDER user_id={user_id} id={folder_id} name={clean_slug} parent_id={parent_id}")
-        except Exception:
-            pass
+            record_text = f"#USER_FOLDER id={folder_id} user_id={user_id} name={urllib.parse.quote(folder_name)} parent_id={parent_id}"
+            await c.send_message(channel, record_text)
+        except Exception as e:
+            print("Error syncing folder creation to cloud channel:", e)
 
-    return {"status": "ok", "folder": {"id": folder_id, "name": folder_name, "parent_id": parent_id}}
+    return secure_json_response({
+        "status": "ok",
+        "folder": {
+            "id": folder_id,
+            "name": folder_name,
+            "parent_id": parent_id,
+            "item_count": 0
+        }
+    })
 
 @app.delete("/api/folders/{folder_id}")
 async def delete_folder(folder_id: str, user: dict = Depends(get_current_user)):
     user_id = user["id"]
-    c = get_client()
     with get_db() as conn:
-        files_to_delete = conn.execute("SELECT message_id FROM files WHERE user_id = ? AND folder_id = ?", (user_id, folder_id)).fetchall()
-        msg_ids = [r["message_id"] for r in files_to_delete]
-        if msg_ids and c.is_connected() and await c.is_user_authorized():
+        cur = conn.execute("SELECT message_id FROM files WHERE user_id = ? AND folder_id = ?", (user_id, folder_id))
+        msg_ids = [r[0] for r in cur.fetchall()]
+
+        c = await ensure_client_connected()
+        if c.is_connected() and msg_ids:
             try:
                 channel = await get_database_channel(c)
                 await c.delete_messages(channel, msg_ids)
@@ -913,7 +1064,7 @@ async def delete_folder(folder_id: str, user: dict = Depends(get_current_user)):
         conn.execute("DELETE FROM folders WHERE user_id = ? AND id = ?", (user_id, folder_id))
         conn.commit()
 
-    return {"status": "ok"}
+    return secure_json_response({"status": "ok"})
 
 # Per-User Files API
 @app.get("/api/files")
@@ -934,6 +1085,9 @@ async def list_files(
         curr_token = x_auth_token.strip()
     elif token:
         curr_token = token.strip()
+
+    c = await ensure_client_connected()
+    await ensure_user_channel_synced(c, user_id)
 
     actual_folder_id = folder_id if (folder_id and folder_id != "root") else None
     with get_db() as conn:
@@ -965,190 +1119,98 @@ async def list_files(
         f["direct_link"] = f"/d/{f['message_id']}{t_param}"
         f["thumb_url"] = f"/api/thumb/{f['message_id']}{t_param}"
 
-    return {"files": files}
+    return secure_json_response({"files": files})
 
-# Background Telegram Upload Worker (Tagged to User & Channel)
-async def background_telegram_upload(
-    task_id: str,
-    temp_path: str,
-    temp_dir: str,
-    filename: str,
-    folder_id: Optional[str],
-    user_id: str,
-    username: str,
-    file_size: int,
-    mime_type: str,
-    media_type: str
-):
-    c = get_client()
-    start_time = time.time()
-
-    def progress_cb(current, total):
-        elapsed = time.time() - start_time
-        speed = current / elapsed if elapsed > 0 else 0
-        pct = round((current / total) * 100, 1) if total > 0 else 0
-        upload_tasks[task_id].update({
-            "status": "saving_to_cloud",
-            "percent": pct,
-            "uploaded": current,
-            "total": total,
-            "speed": f"{format_size(int(speed))}/s",
-            "formatted": f"{format_size(current)} / {format_size(total)}"
-        })
-
-    def is_cancelled():
-        return upload_tasks.get(task_id, {}).get("cancelled", False)
-
-    try:
-        upload_tasks[task_id]["status"] = "saving_to_cloud"
-        channel = await get_database_channel(c)
-        folder_tag = f"[Folder: {folder_id}]" if folder_id and folder_id != "root" else "[Root]"
-        
-        # High-speed pipelined upload with cancel check
-        uploaded_file = await fast_pipelined_upload(
-            c,
-            temp_path,
-            file_name=filename,
-            progress_callback=progress_cb,
-            cancel_check=is_cancelled
-        )
-
-        if is_cancelled():
-            raise asyncio.CancelledError("Upload cancelled by user")
-
-        # Send to userdatabase channel tagged with User ID
-        is_video = media_type == "video"
-        caption = f"#USER_FILE user_id={user_id} folder_id={folder_id or 'root'} mime={mime_type} media={media_type}\n{filename}"
-        sent_msg = await c.send_file(
-            channel,
-            uploaded_file,
-            caption=caption,
-            supports_streaming=is_video,
-            force_document=not is_video
-        )
-
-        # Record in SQLite database linked strictly to this user
-        actual_folder = folder_id if (folder_id and folder_id != "root") else None
-        with get_db() as conn:
-            cur = conn.execute("""
-                INSERT OR IGNORE INTO files (user_id, message_id, folder_id, name, size, mime_type, media_type, date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            """, (user_id, sent_msg.id, actual_folder, filename, file_size, mime_type, media_type))
-            file_id = cur.lastrowid
-            conn.commit()
-
-        upload_tasks[task_id].update({
-            "status": "completed",
-            "percent": 100.0,
-            "formatted": f"{format_size(file_size)} / {format_size(file_size)}",
-            "file": {
-                "id": file_id,
-                "message_id": sent_msg.id,
-                "name": filename,
-                "size": file_size,
-                "size_formatted": format_size(file_size),
-                "media_type": media_type,
-            }
-        })
-
-    except asyncio.CancelledError:
-        print(f"Upload task {task_id} was cancelled.")
-        upload_tasks[task_id]["status"] = "cancelled"
-    except Exception as e:
-        print(f"Error in background upload task {task_id}: {e}")
-        upload_tasks[task_id].update({
-            "status": "error",
-            "error": str(e)
-        })
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-# Upload endpoint - checks user authentication
-@app.post("/api/upload")
-async def upload_file(
-    folder_id: Optional[str] = Form(None),
-    file: UploadFile = File(...),
+# Stateless Direct Chunked Upload API (Works natively on Vercel Serverless)
+@app.post("/api/upload/chunk")
+async def upload_chunk(
+    file_id: int = Form(...),
+    part_index: int = Form(...),
+    total_parts: int = Form(...),
+    chunk: UploadFile = File(...),
     user: dict = Depends(get_current_user)
 ):
-    c = get_client()
-    if not c.is_connected():
-        await c.connect()
+    c = await ensure_client_connected()
+    chunk_bytes = await chunk.read()
+    if not chunk_bytes:
+        raise HTTPException(status_code=400, detail="Empty chunk received")
 
-    filename = file.filename or "upload_file"
-    temp_dir = tempfile.mkdtemp()
-    temp_path = os.path.join(temp_dir, filename)
+    is_big = total_parts > 20
+    if is_big:
+        req = SaveBigFilePartRequest(file_id, part_index, total_parts, chunk_bytes)
+    else:
+        req = SaveFilePartRequest(file_id, part_index, chunk_bytes)
 
-    task_id = str(uuid.uuid4())
-    upload_tasks[task_id] = {
-        "task_id": task_id,
-        "filename": filename,
-        "status": "receiving",
-        "cancelled": False,
-        "percent": 0.0,
-        "uploaded": 0,
-        "total": 0,
-        "speed": "0 B/s",
-        "formatted": "0 B / 0 B"
+    await c(req)
+    return secure_json_response({"status": "ok", "part": part_index})
+
+@app.post("/api/upload/finish")
+async def finish_upload(
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
+    payload = await parse_encrypted_body(request)
+    file_id = int(payload.get("file_id"))
+    filename = payload.get("filename") or "uploaded_file"
+    total_parts = int(payload.get("total_parts", 1))
+    total_size = int(payload.get("total_size", 0))
+    folder_id = payload.get("folder_id")
+    if folder_id in ("root", "None", ""): folder_id = None
+
+    c = await ensure_client_connected()
+    channel = await get_database_channel(c)
+
+    is_big = total_parts > 20
+    if is_big:
+        input_file = InputFileBig(id=file_id, parts=total_parts, name=filename)
+    else:
+        input_file = InputFile(id=file_id, parts=total_parts, name=filename, md5_checksum="")
+
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    media_type = "document"
+    if mime_type.startswith("video/"): media_type = "video"
+    elif mime_type.startswith("audio/"): media_type = "audio"
+    elif mime_type.startswith("image/"): media_type = "image"
+    is_video = media_type == "video"
+
+    caption = f"#USER_FILE user_id={user['id']} folder_id={folder_id or 'root'} mime={mime_type} media={media_type}\n{filename}"
+
+    sent_msg = await c.send_file(
+        channel,
+        file=input_file,
+        caption=caption,
+        supports_streaming=is_video,
+        force_document=not is_video
+    )
+
+    with get_db() as conn:
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO files (user_id, message_id, folder_id, name, size, mime_type, media_type, date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """, (user["id"], sent_msg.id, folder_id, filename, total_size, mime_type, media_type))
+        new_id = cur.lastrowid
+        conn.commit()
+
+    file_res = {
+        "id": new_id,
+        "message_id": sent_msg.id,
+        "name": filename,
+        "size": total_size,
+        "size_formatted": format_size(total_size),
+        "mime_type": mime_type,
+        "media_type": media_type,
+        "date": "Just now",
+        "download_url": f"/d/{sent_msg.id}",
+        "stream_url": f"/api/stream/{sent_msg.id}" if media_type in ("video", "audio") else None,
+        "thumb_url": f"/api/thumb/{sent_msg.id}" if media_type == "image" else None
     }
-
-    try:
-        size = 0
-        with open(temp_path, "wb") as buffer:
-            while chunk := await file.read(4 * 1024 * 1024):
-                if upload_tasks[task_id]["cancelled"]:
-                    raise asyncio.CancelledError("Cancelled while receiving")
-                buffer.write(chunk)
-                size += len(chunk)
-
-        mime_type = file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        media_type = "document"
-        if mime_type.startswith("video/"):
-            media_type = "video"
-        elif mime_type.startswith("audio/"):
-            media_type = "audio"
-        elif mime_type.startswith("image/"):
-            media_type = "image"
-
-        upload_tasks[task_id].update({
-            "status": "queued",
-            "total": size,
-            "formatted": f"0 B / {format_size(size)}"
-        })
-
-        asyncio.create_task(
-            background_telegram_upload(
-                task_id, temp_path, temp_dir, filename, folder_id, user["id"], user["username"], size, mime_type, media_type
-            )
-        )
-
-        return {"status": "ok", "task_id": task_id, "size": size}
-
-    except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        upload_tasks[task_id] = {"status": "error", "error": str(e), "cancelled": True}
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Cancel upload endpoint
-@app.post("/api/upload/cancel")
-async def cancel_upload(task_id: str = Query(...)):
-    if task_id in upload_tasks:
-        upload_tasks[task_id]["cancelled"] = True
-        upload_tasks[task_id]["status"] = "cancelled"
-        return {"status": "ok", "message": "Upload cancelled"}
-    raise HTTPException(status_code=404, detail="Task not found")
-
-# Progress polling endpoint
-@app.get("/api/upload/progress")
-async def get_upload_progress(task_id: str = Query(...)):
-    if task_id not in upload_tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return upload_tasks[task_id]
+    return secure_json_response({"status": "completed", "file": file_res})
 
 # Delete file - only uploader can delete
 @app.delete("/api/files/{message_id}")
 async def delete_file(message_id: int, user: dict = Depends(get_current_user)):
     user_id = user["id"]
-    c = get_client()
+    c = await ensure_client_connected()
 
     with get_db() as conn:
         f = conn.execute("SELECT id FROM files WHERE message_id = ? AND user_id = ?", (message_id, user_id)).fetchone()
@@ -1165,9 +1227,9 @@ async def delete_file(message_id: int, user: dict = Depends(get_current_user)):
         except Exception as e:
             print("TG delete error:", e)
 
-    return {"status": "ok"}
+    return secure_json_response({"status": "ok"})
 
-# Verify File Access: Strictly ensures only the user who uploaded the file can access/stream/download it
+# Verify File Access (Stateless Token Supported)
 async def verify_file_access(message_id: int, token: Optional[str] = None, auth_header: Optional[str] = None) -> str:
     extracted_token = None
     if auth_header and auth_header.startswith("Bearer "):
@@ -1176,24 +1238,28 @@ async def verify_file_access(message_id: int, token: Optional[str] = None, auth_
         extracted_token = token.strip()
 
     if not extracted_token:
-        raise HTTPException(status_code=401, detail="Authentication token required. Only the uploader can access this file.")
+        raise HTTPException(status_code=401, detail="Authentication token required.")
+
+    token_data = verify_user_token(extracted_token)
+    current_user_id = token_data["id"] if token_data else None
+
+    if not current_user_id:
+        with get_db() as conn:
+            t_row = conn.execute("SELECT user_id FROM user_tokens WHERE token = ?", (extracted_token,)).fetchone()
+            if t_row:
+                current_user_id = t_row["user_id"]
+
+    if not current_user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token.")
 
     with get_db() as conn:
-        t_row = conn.execute("SELECT user_id FROM user_tokens WHERE token = ?", (extracted_token,)).fetchone()
-        if not t_row:
-            raise HTTPException(status_code=401, detail="Invalid or expired session token.")
-        current_user_id = t_row["user_id"]
-
         f_row = conn.execute("SELECT user_id FROM files WHERE message_id = ?", (message_id,)).fetchone()
         if f_row:
             if f_row["user_id"] != current_user_id:
                 raise HTTPException(status_code=403, detail="Access denied. Only the uploader can access this file.")
             return current_user_id
 
-    # If file record is not found in local SQLite (e.g. server restart / Vercel instance), check Telegram channel
-    c = get_client()
-    if not c.is_connected():
-        await c.connect()
+    c = await ensure_client_connected()
     channel = await get_database_channel(c)
     msg = await c.get_messages(channel, ids=message_id)
     if not msg:
@@ -1211,12 +1277,9 @@ async def verify_file_access(message_id: int, token: Optional[str] = None, auth_
         f_mime = (msg.file.mime_type if msg.file else None) or "application/octet-stream"
         f_name = (msg.file.name if msg.file else None) or (text.split("\n", 1)[1] if "\n" in text else "file")
         m_type = "document"
-        if f_mime.startswith("video/"):
-            m_type = "video"
-        elif f_mime.startswith("audio/"):
-            m_type = "audio"
-        elif f_mime.startswith("image/"):
-            m_type = "image"
+        if f_mime.startswith("video/"): m_type = "video"
+        elif f_mime.startswith("audio/"): m_type = "audio"
+        elif f_mime.startswith("image/"): m_type = "image"
         conn.execute("""
             INSERT OR IGNORE INTO files (user_id, message_id, folder_id, name, size, mime_type, media_type, date)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1242,15 +1305,12 @@ async def stream_media(
     authorization: Optional[str] = Header(None)
 ):
     await verify_file_access(message_id, token=token, auth_header=authorization)
-    c = get_client()
-    if not c.is_connected():
-        await c.connect()
+    c = await ensure_client_connected()
 
     is_download = "download" in request.url.path
     channel = await get_database_channel(c)
     msg = await c.get_messages(channel, ids=message_id)
     if not msg or not msg.media:
-        # Fallback to Saved Messages if not found in channel
         msg = await c.get_messages("me", ids=message_id)
     if not msg or not msg.media:
         raise HTTPException(status_code=404, detail="Media not found on ascloud")
@@ -1274,7 +1334,6 @@ async def stream_media(
         "Cache-Control": "public, max-age=86400",
     }
 
-    # RFC 6266 latin-1 safe Content-Disposition with UTF-8 filename*
     ascii_filename = re.sub(r'[^\x20-\x7E]', '_', file_name).replace('"', '')
     encoded_filename = urllib.parse.quote(file_name, safe='')
     if is_download:
@@ -1317,7 +1376,6 @@ async def stream_media(
 
     return StreamingResponse(file_streamer(), status_code=status_code, headers=headers)
 
-# Thumbnail preview endpoint
 @app.get("/api/thumb/{message_id}")
 async def get_thumb(
     message_id: int,
@@ -1325,9 +1383,7 @@ async def get_thumb(
     authorization: Optional[str] = Header(None)
 ):
     await verify_file_access(message_id, token=token, auth_header=authorization)
-    c = get_client()
-    if not c.is_connected():
-        await c.connect()
+    c = await ensure_client_connected()
 
     channel = await get_database_channel(c)
     msg = await c.get_messages(channel, ids=message_id)
@@ -1346,6 +1402,7 @@ async def get_thumb(
         print("Thumbnail error:", e)
 
     return Response(content=b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82", media_type="image/png")
+
 
 # anonc by ascloud - Multi-User Apple iOS OLED Dark Theme Frontend
 HTML_PAGE = """<!DOCTYPE html>
@@ -1926,11 +1983,96 @@ HTML_PAGE = """<!DOCTYPE html>
     let currentFilter = 'all';
     let currentFiles = [];
     let directCdnUrl = '';
-    let currentUploadXhr = null;
-    let currentTaskId = null;
+    let currentChunkAbortController = null;
     let isUploadCancelled = false;
     let authMode = 'login';
     let currentUser = null;
+
+    // AES-256-GCM Hardware-Accelerated WebCrypto Engine
+    const AES_KEY_HEX = "3d0da7dda72c4c6298901e1c2aa0dcc255a21ec897c5aec4427248e118564a8a";
+    let _cryptoKey = null;
+
+    function hexToBytes(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+      }
+      return bytes;
+    }
+
+    async function getAesKey() {
+      if (!_cryptoKey) {
+        const rawKey = hexToBytes(AES_KEY_HEX);
+        _cryptoKey = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+      }
+      return _cryptoKey;
+    }
+
+    async function encryptPayload(dataObj) {
+      try {
+        const key = await getAesKey();
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const plaintext = new TextEncoder().encode(JSON.stringify(dataObj));
+        const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, plaintext);
+        const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+        combined.set(iv, 0);
+        combined.set(new Uint8Array(ciphertext), iv.length);
+        let binary = '';
+        for (let i = 0; i < combined.length; i++) binary += String.fromCharCode(combined[i]);
+        return btoa(binary);
+      } catch (err) {
+        console.error('Encryption error:', err);
+        throw err;
+      }
+    }
+
+    async function decryptPayload(b64Str) {
+      try {
+        const key = await getAesKey();
+        const binary = atob(b64Str);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const iv = bytes.slice(0, 12);
+        const ciphertext = bytes.slice(12);
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ciphertext);
+        return JSON.parse(new TextDecoder().decode(decrypted));
+      } catch (err) {
+        console.error('Decryption error:', err);
+        throw err;
+      }
+    }
+
+    // Unified Secure API Client (All JSON traffic AES-256 encrypted)
+    async function secureApiCall(url, method = 'GET', data = null) {
+      const headers = {};
+      const token = getAuthToken();
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      let body = undefined;
+      if (data !== null) {
+        headers['Content-Type'] = 'application/json';
+        const enc = await encryptPayload(data);
+        body = JSON.stringify({ e: enc });
+      }
+
+      const res = await fetch(url, { method, headers, body });
+      const rawText = await res.text();
+      let resJson = null;
+      try {
+        resJson = JSON.parse(rawText);
+      } catch (e) {
+        throw new Error(rawText || 'Server error');
+      }
+
+      if (resJson && resJson.e) {
+        const decrypted = await decryptPayload(resJson.e);
+        if (!res.ok) throw new Error(decrypted.detail || 'Request failed');
+        return decrypted;
+      }
+
+      if (!res.ok) throw new Error(resJson.detail || 'Request failed');
+      return resJson;
+    }
 
     function getAuthToken() {
       return localStorage.getItem('anonc_token');
@@ -1964,24 +2106,17 @@ HTML_PAGE = """<!DOCTYPE html>
         return;
       }
       try {
-        const res = await fetch('/api/user/me', {
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        if (res.ok) {
-          const data = await res.json();
-          currentUser = data.user;
-          document.getElementById('authModal').classList.add('hidden');
-          document.getElementById('authActions').classList.remove('hidden');
-          document.getElementById('unauthActions').classList.add('hidden');
-          
-          updateUserDisplay(currentUser, data.stats);
-          loadContent();
-        } else {
-          setAuthToken(null);
-          showAuthModal();
-        }
+        const data = await secureApiCall('/api/user/me');
+        currentUser = data.user;
+        document.getElementById('authModal').classList.add('hidden');
+        document.getElementById('authActions').classList.remove('hidden');
+        document.getElementById('unauthActions').classList.add('hidden');
+
+        updateUserDisplay(currentUser, data.stats);
+        loadContent();
       } catch (e) {
         console.error('Auth error:', e);
+        setAuthToken(null);
         showAuthModal();
       }
     }
@@ -2047,69 +2182,81 @@ HTML_PAGE = """<!DOCTYPE html>
       const prefs = user.settings || {};
       const autoSw = document.getElementById('switchAutoPreview');
       const seekSw = document.getElementById('switchFastSeek');
-      if (prefs.auto_preview !== false) autoSw.classList.add('active'); else autoSw.classList.remove('active');
-      if (prefs.fast_seek !== false) seekSw.classList.add('active'); else seekSw.classList.remove('active');
+      if (autoSw) {
+        if (prefs.auto_preview !== false) autoSw.classList.add('active');
+        else autoSw.classList.remove('active');
+      }
+      if (seekSw) {
+        if (prefs.fast_seek !== false) seekSw.classList.add('active');
+        else seekSw.classList.remove('active');
+      }
 
       lucide.createIcons();
     }
 
     function showAuthModal() {
-      document.getElementById('loadingIndicator').classList.add('hidden');
       document.getElementById('authModal').classList.remove('hidden');
       document.getElementById('authActions').classList.add('hidden');
       document.getElementById('unauthActions').classList.remove('hidden');
     }
 
     async function loadContent() {
-      document.getElementById('loadingIndicator').classList.remove('hidden');
-      await Promise.all([loadFolders(), loadFiles()]);
-      document.getElementById('loadingIndicator').classList.add('hidden');
+      await loadFolders();
+      await loadFiles();
     }
 
     async function loadFolders() {
-      const token = getAuthToken();
-      if (!token) return;
       try {
-        const res = await fetch(`/api/folders?parent_id=${currentFolderId}`, {
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        const data = await res.json();
-        renderBreadcrumbs(data.breadcrumbs || []);
+        const url = `/api/folders${currentFolderId && currentFolderId !== 'root' ? `?parent_id=${currentFolderId}` : ''}`;
+        const data = await secureApiCall(url);
         renderFolders(data.folders || []);
-      } catch (e) {
-        console.error('Error loading folders:', e);
+        renderBreadcrumbs(data.breadcrumbs || []);
+      } catch (err) {
+        console.error('Failed to load folders:', err);
       }
     }
 
     async function loadFiles() {
-      const token = getAuthToken();
-      if (!token) return;
+      const query = document.getElementById('searchInput').value.trim();
+      const filesContainer = document.getElementById('filesContainer');
+      const filesEmptyState = document.getElementById('filesEmptyState');
+      const loadingState = document.getElementById('loadingState');
+
+      filesContainer.innerHTML = '';
+      filesEmptyState.classList.add('hidden');
+      loadingState.classList.remove('hidden');
+
       try {
-        const query = document.getElementById('searchInput').value.trim();
-        const res = await fetch(`/api/files?folder_id=${currentFolderId}&filter=${currentFilter}&search=${encodeURIComponent(query)}`, {
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        const data = await res.json();
+        const url = `/api/files?folder_id=${currentFolderId}&filter=${currentFilter}&search=${encodeURIComponent(query)}`;
+        const data = await secureApiCall(url);
         currentFiles = data.files || [];
-        renderFiles(currentFiles);
-      } catch (e) {
-        console.error('Error loading files:', e);
+
+        loadingState.classList.add('hidden');
+        if (currentFiles.length === 0) {
+          filesEmptyState.classList.remove('hidden');
+        } else {
+          renderFiles(currentFiles);
+        }
+      } catch (err) {
+        loadingState.classList.add('hidden');
+        console.error('Failed to load files:', err);
       }
     }
 
     function renderBreadcrumbs(crumbs) {
-      const container = document.getElementById('breadcrumbs');
-      container.innerHTML = `
-        <button class="hover:text-white transition flex items-center gap-1 ${currentFolderId === 'root' ? 'text-white font-semibold' : 'text-white/50'}" onclick="navigateToFolder('root')">
-          <i data-lucide="hard-drive" class="w-3.5 h-3.5 text-blue-400"></i>
-          <span>Files</span>
+      const nav = document.getElementById('breadcrumbs');
+      nav.innerHTML = `
+        <button class="hover:text-white transition flex items-center gap-1 ${currentFolderId === 'root' ? 'text-white' : ''}" onclick="navigateToFolder('root')">
+          <i data-lucide="cloud" class="w-4 h-4"></i>
+          <span>Cloud Vault</span>
         </button>
       `;
+
       crumbs.forEach((c, idx) => {
         const isLast = idx === crumbs.length - 1;
-        container.innerHTML += `
-          <i data-lucide="chevron-right" class="w-3.5 h-3.5 text-white/20"></i>
-          <button class="hover:text-white transition truncate max-w-[120px] ${isLast ? 'text-white font-semibold' : 'text-white/50'}" onclick="navigateToFolder('${c.id}')">
+        nav.innerHTML += `
+          <i data-lucide="chevron-right" class="w-3.5 h-3.5 text-white/30 flex-shrink-0"></i>
+          <button class="hover:text-white transition truncate max-w-[150px] ${isLast ? 'text-white font-semibold' : ''}" onclick="navigateToFolder('${c.id}')">
             ${c.name}
           </button>
         `;
@@ -2118,166 +2265,102 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     function renderFolders(folders) {
-      const container = document.getElementById('foldersGrid');
       const section = document.getElementById('foldersSection');
-      container.innerHTML = '';
-      if (!folders.length) {
+      const list = document.getElementById('foldersList');
+      if (!folders || folders.length === 0) {
         section.classList.add('hidden');
         return;
       }
       section.classList.remove('hidden');
-      folders.forEach((f, idx) => {
-        const div = document.createElement('div');
-        div.className = 'ios-card p-3.5 rounded-2xl cursor-pointer group flex items-center justify-between card-animate';
-        div.style.animationDelay = `${idx * 0.03}s`;
-        div.innerHTML = `
-          <div class="flex items-center gap-3 truncate" onclick="navigateToFolder('${f.id}')">
-            <div class="w-9 h-9 rounded-xl bg-blue-500/10 flex items-center justify-center text-blue-400 group-hover:scale-105 transition flex-shrink-0">
-              <i data-lucide="folder" class="w-5 h-5 fill-blue-500/20"></i>
+      list.innerHTML = folders.map(f => `
+        <div class="ios-card p-3 rounded-2xl flex items-center justify-between group cursor-pointer hover:border-white/20 transition-all" onclick="navigateToFolder('${f.id}')">
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="w-10 h-10 rounded-xl bg-blue-500/10 flex items-center justify-center flex-shrink-0 text-blue-400 group-hover:scale-105 transition">
+              <i data-lucide="folder" class="w-5 h-5"></i>
             </div>
-            <div class="truncate">
-              <div class="text-xs font-semibold text-white truncate">${f.name}</div>
-              <div class="text-[10px] text-white/40 mt-0.5">${f.item_count} items</div>
+            <div class="min-w-0">
+              <h4 class="text-xs font-semibold text-white/90 truncate group-hover:text-white transition">${f.name}</h4>
+              <p class="text-[10px] text-white/40">${f.item_count || 0} items</p>
             </div>
           </div>
-          <button class="delete-folder-btn p-1.5 text-white/20 hover:text-red-400 transition rounded-lg" data-id="${f.id}" title="Delete folder">
+          <button class="p-1.5 rounded-lg opacity-0 group-hover:opacity-100 hover:bg-white/10 text-white/40 hover:text-red-400 transition" onclick="event.stopPropagation(); deleteFolder('${f.id}', '${f.name}')">
             <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
           </button>
-        `;
-        container.appendChild(div);
-      });
-
-      document.querySelectorAll('.delete-folder-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-          e.stopPropagation();
-          const fid = btn.getAttribute('data-id');
-          if (confirm('Delete this folder and its files?')) {
-            await fetch(`/api/folders/${fid}`, {
-              method: 'DELETE',
-              headers: { 'Authorization': `Bearer ${getAuthToken()}` }
-            });
-            showToast('Folder deleted');
-            loadContent();
-          }
-        });
-      });
+        </div>
+      `).join('');
       lucide.createIcons();
     }
 
     function renderFiles(files) {
-      const container = document.getElementById('filesGrid');
-      const emptyContainer = document.getElementById('emptyContainer');
-      const filesCount = document.getElementById('filesCount');
-      const filesSection = document.getElementById('filesSection');
+      const container = document.getElementById('filesContainer');
+      container.innerHTML = files.map(f => {
+        let iconName = 'file';
+        let iconColor = 'text-blue-400';
+        let bgGradient = 'from-blue-500/10 to-indigo-500/10';
 
-      filesCount.textContent = `${files.length} items`;
-      container.innerHTML = '';
+        if (f.media_type === 'video') {
+          iconName = 'film';
+          iconColor = 'text-purple-400';
+          bgGradient = 'from-purple-500/10 to-pink-500/10';
+        } else if (f.media_type === 'audio') {
+          iconName = 'music';
+          iconColor = 'text-pink-400';
+          bgGradient = 'from-pink-500/10 to-rose-500/10';
+        } else if (f.media_type === 'image') {
+          iconName = 'image';
+          iconColor = 'text-emerald-400';
+          bgGradient = 'from-emerald-500/10 to-teal-500/10';
+        }
 
-      const foldersCount = document.querySelectorAll('#foldersGrid > div').length;
-      if (!files.length && !foldersCount) {
-        emptyContainer.classList.remove('hidden');
-        filesSection.classList.add('hidden');
-        return;
-      }
-      emptyContainer.classList.add('hidden');
-      filesSection.classList.remove('hidden');
-
-      files.forEach((f, idx) => {
-        const card = document.createElement('div');
-        card.className = 'ios-card rounded-2xl p-3 flex flex-col justify-between group card-animate';
-        card.style.animationDelay = `${idx * 0.03}s`;
-        
-        let typeIcon = 'file';
-        let badgeColor = 'bg-white/10 text-white/70';
-        if (f.media_type === 'video') { typeIcon = 'video'; badgeColor = 'bg-purple-500/20 text-purple-300'; }
-        else if (f.media_type === 'audio') { typeIcon = 'music'; badgeColor = 'bg-emerald-500/20 text-emerald-300'; }
-        else if (f.media_type === 'image') { typeIcon = 'image'; badgeColor = 'bg-amber-500/20 text-amber-300'; }
-
-        const directLink = `${window.location.origin}${f.direct_link}`;
-
-        card.innerHTML = `
-          <div>
-            <!-- Thumbnail / Header -->
-            <div class="h-28 rounded-xl bg-black/40 border border-white/[0.04] mb-2.5 overflow-hidden relative flex items-center justify-center cursor-pointer open-file" data-id="${f.message_id}">
-              ${f.media_type === 'image' || f.media_type === 'video' ? `
-                <img src="${f.thumb_url}" class="w-full h-full object-cover group-hover:scale-105 transition duration-300" onerror="this.style.display='none'">
+        return `
+          <div class="ios-card rounded-2xl p-3 flex flex-col justify-between group hover:border-white/20 transition-all duration-300 relative overflow-hidden">
+            <div class="w-full aspect-video rounded-xl bg-gradient-to-tr ${bgGradient} flex items-center justify-center relative overflow-hidden mb-2.5">
+              ${f.media_type === 'image' && f.thumb_url ? `
+                <img src="${f.thumb_url}" class="w-full h-full object-cover group-hover:scale-105 transition duration-300" alt="${f.name}" onerror="this.onerror=null; this.classList.add('hidden');" />
+              ` : `
+                <i data-lucide="${iconName}" class="w-8 h-8 ${iconColor} group-hover:scale-110 transition duration-300"></i>
+              `}
+              ${f.media_type === 'video' ? `
+                <button class="absolute inset-0 m-auto w-10 h-10 rounded-full bg-black/60 backdrop-blur-md flex items-center justify-center text-white opacity-0 group-hover:opacity-100 hover:scale-110 transition duration-200" onclick="playMedia('${f.message_id}', '${f.name}', 'video')">
+                  <i data-lucide="play" class="w-5 h-5 ml-0.5 fill-white"></i>
+                </button>
               ` : ''}
-              <div class="absolute w-10 h-10 rounded-full bg-white/10 backdrop-blur-md flex items-center justify-center text-white/80 group-hover:scale-110 transition">
-                <i data-lucide="${f.media_type === 'video' ? 'play' : typeIcon}" class="w-4 h-4 ${f.media_type === 'video' ? 'ml-0.5' : ''}"></i>
+              ${f.media_type === 'audio' ? `
+                <button class="absolute inset-0 m-auto w-10 h-10 rounded-full bg-black/60 backdrop-blur-md flex items-center justify-center text-white opacity-0 group-hover:opacity-100 hover:scale-110 transition duration-200" onclick="playMedia('${f.message_id}', '${f.name}', 'audio')">
+                  <i data-lucide="play" class="w-5 h-5 ml-0.5 fill-white"></i>
+                </button>
+              ` : ''}
+            </div>
+
+            <div class="min-w-0">
+              <h4 class="text-xs font-semibold text-white/90 truncate mb-1" title="${f.name}">${f.name}</h4>
+              <div class="flex items-center justify-between text-[10px] text-white/40">
+                <span>${f.size_formatted}</span>
+                <span class="font-mono">${f.date ? f.date.split(' ')[0] : ''}</span>
               </div>
             </div>
 
-            <div class="flex items-center justify-between gap-2 mb-1">
-              <span class="text-[9px] uppercase px-1.5 py-0.5 rounded font-mono font-semibold ${badgeColor}">
-                ${f.media_type}
-              </span>
-              <span class="text-[11px] font-mono text-white/40">${f.size_formatted}</span>
-            </div>
-
-            <h4 class="text-xs font-medium text-white/90 truncate group-hover:text-blue-400 transition" title="${f.name}">
-              ${f.name}
-            </h4>
-          </div>
-
-          <!-- Bottom Actions -->
-          <div class="mt-3 pt-2 border-t border-white/[0.06] flex items-center justify-between">
-            <button class="open-file text-[11px] font-medium text-blue-400 hover:text-blue-300 flex items-center gap-1" data-id="${f.message_id}">
-              <i data-lucide="play-circle" class="w-3.5 h-3.5"></i>
-              <span>Open</span>
-            </button>
-
-            <div class="flex items-center gap-1">
-              <button class="copy-cdn-btn ios-button p-1.5 rounded-lg text-white/50 hover:text-blue-400" data-link="${directLink}" title="Copy Direct CDN Link">
-                <i data-lucide="link-2" class="w-3.5 h-3.5"></i>
-              </button>
-              <a href="${f.download_url}" download class="ios-button p-1.5 rounded-lg text-white/50 hover:text-white" title="Download">
-                <i data-lucide="download" class="w-3.5 h-3.5"></i>
-              </a>
-              <button class="delete-file-btn ios-button p-1.5 rounded-lg text-white/30 hover:text-red-400" data-id="${f.message_id}" title="Delete">
+            <div class="flex items-center justify-between pt-2.5 mt-2 border-t border-white/[0.04]">
+              <div class="flex items-center gap-1">
+                ${f.media_type === 'video' || f.media_type === 'audio' ? `
+                  <button class="p-1.5 rounded-lg hover:bg-white/10 text-white/60 hover:text-white transition" title="Stream" onclick="playMedia('${f.message_id}', '${f.name}', '${f.media_type}')">
+                    <i data-lucide="play" class="w-3.5 h-3.5"></i>
+                  </button>
+                ` : ''}
+                <a href="${f.download_url}" download class="p-1.5 rounded-lg hover:bg-white/10 text-white/60 hover:text-white transition" title="Download">
+                  <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                </a>
+                <button class="p-1.5 rounded-lg hover:bg-white/10 text-white/60 hover:text-white transition" title="Share Direct Link" onclick="shareDirectLink('${f.message_id}', '${f.name}')">
+                  <i data-lucide="share-2" class="w-3.5 h-3.5"></i>
+                </button>
+              </div>
+              <button class="p-1.5 rounded-lg hover:bg-white/10 text-white/30 hover:text-red-400 transition" title="Delete" onclick="deleteFile('${f.message_id}', '${f.name}')">
                 <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
               </button>
             </div>
           </div>
         `;
-
-        container.appendChild(card);
-      });
-
-      // Bind Open / Play
-      document.querySelectorAll('.open-file').forEach(el => {
-        el.addEventListener('click', () => {
-          const mid = parseInt(el.getAttribute('data-id'));
-          openPlayer(mid);
-        });
-      });
-
-      // Bind Direct CDN Copy
-      document.querySelectorAll('.copy-cdn-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const link = btn.getAttribute('data-link');
-          navigator.clipboard.writeText(link);
-          showToast('Direct CDN link copied!');
-        });
-      });
-
-      // Bind Delete File
-      document.querySelectorAll('.delete-file-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-          e.stopPropagation();
-          const mid = btn.getAttribute('data-id');
-          if (confirm('Delete this file from your anonc storage?')) {
-            await fetch(`/api/files/${mid}`, {
-              method: 'DELETE',
-              headers: { 'Authorization': `Bearer ${getAuthToken()}` }
-            });
-            showToast('File deleted');
-            loadFiles();
-            checkAuth();
-          }
-        });
-      });
-
+      }).join('');
       lucide.createIcons();
     }
 
@@ -2286,105 +2369,81 @@ HTML_PAGE = """<!DOCTYPE html>
       loadContent();
     }
 
-    // Player Modal
-    function openPlayer(messageId) {
-      const file = currentFiles.find(f => f.message_id === messageId);
-      if (!file) return;
-
-      const modal = document.getElementById('playerModal');
-      const body = document.getElementById('playerBody');
-      const name = document.getElementById('playerFilename');
-      const download = document.getElementById('playerDownloadBtn');
-      const copyCdn = document.getElementById('playerCopyCdnBtn');
-
-      name.textContent = `${file.name} (${file.size_formatted})`;
-      download.href = file.download_url;
-      directCdnUrl = `${window.location.origin}${file.direct_link}`;
-
-      body.innerHTML = '';
-      body.className = 'p-4 flex items-center justify-center bg-black min-h-[300px]';
-      if (file.media_type === 'video') {
-        const video = document.createElement('video');
-        video.controls = true;
-        video.autoplay = true;
-        video.playsInline = true;
-        video.preload = 'auto';
-        video.className = 'w-full max-h-[70vh] rounded-xl outline-none';
-        video.src = file.stream_url;
-        body.appendChild(video);
-      } else if (file.media_type === 'audio') {
-        body.className = 'bg-black p-12 flex flex-col items-center justify-center gap-6';
-        body.innerHTML = `
-          <div class="w-20 h-20 rounded-2xl bg-blue-500/20 flex items-center justify-center text-blue-400">
-            <i data-lucide="music" class="w-10 h-10"></i>
-          </div>
-          <audio controls autoplay preload="auto" class="w-full max-w-md outline-none" src="${file.stream_url}"></audio>
-        `;
-      } else if (file.media_type === 'image') {
-        const img = document.createElement('img');
-        img.className = 'max-w-full max-h-[70vh] object-contain';
-        img.src = file.stream_url;
-        body.appendChild(img);
-      } else {
-        body.innerHTML = `
-          <div class="p-10 text-center">
-            <i data-lucide="file-text" class="w-12 h-12 text-white/30 mx-auto mb-3"></i>
-            <p class="text-xs text-white/60 mb-4">Preview not available for this document format.</p>
-            <a href="${file.download_url}" download class="ios-button-blue text-xs font-semibold px-4 py-2 rounded-xl text-white inline-flex items-center gap-1.5">
-              <i data-lucide="download" class="w-3.5 h-3.5"></i> Download File
-            </a>
-          </div>
-        `;
+    async function deleteFolder(fid, name) {
+      if (!confirm(`Delete folder "${name}" and all its contents?`)) return;
+      try {
+        await secureApiCall(`/api/folders/${fid}`, 'DELETE');
+        showToast('Folder deleted');
+        loadContent();
+      } catch (err) {
+        alert(err.message || 'Failed to delete folder');
       }
-
-      modal.classList.remove('hidden');
-      lucide.createIcons();
     }
 
-    document.getElementById('playerCopyCdnBtn').addEventListener('click', () => {
-      if (directCdnUrl) {
-        navigator.clipboard.writeText(directCdnUrl);
-        showToast('Direct CDN link copied!');
+    async function deleteFile(mid, name) {
+      if (!confirm(`Permanently delete "${name}" from your cloud vault?`)) return;
+      try {
+        await secureApiCall(`/api/files/${mid}`, 'DELETE');
+        showToast('File deleted');
+        loadFiles();
+        checkAuth();
+      } catch (err) {
+        alert(err.message || 'Failed to delete file');
       }
-    });
+    }
 
-    document.getElementById('closePlayerBtn').addEventListener('click', () => {
-      document.getElementById('playerBody').innerHTML = '';
-      document.getElementById('playerModal').classList.add('hidden');
-    });
+    function playMedia(mid, name, type) {
+      const modal = document.getElementById('playerModal');
+      const title = document.getElementById('playerTitle');
+      const videoElem = document.getElementById('videoPlayer');
+      const audioElem = document.getElementById('audioPlayer');
 
-    // Upload files
-    const filePicker = document.getElementById('filePicker');
-    document.getElementById('uploadTriggerBtn').addEventListener('click', () => filePicker.click());
+      title.textContent = name;
+      modal.classList.remove('hidden');
 
-    filePicker.addEventListener('change', () => {
-      if (filePicker.files.length) uploadFileList(filePicker.files);
-    });
+      const token = getAuthToken();
+      const streamUrl = `/api/stream/${mid}?token=${token}`;
 
-    window.addEventListener('dragover', (e) => e.preventDefault());
-    window.addEventListener('drop', (e) => {
-      e.preventDefault();
-      if (e.dataTransfer.files.length) uploadFileList(e.dataTransfer.files);
-    });
+      if (type === 'video') {
+        audioElem.classList.add('hidden');
+        audioElem.pause();
+        videoElem.classList.remove('hidden');
+        videoElem.src = streamUrl;
+        videoElem.play().catch(() => {});
+      } else {
+        videoElem.classList.add('hidden');
+        videoElem.pause();
+        audioElem.classList.remove('hidden');
+        audioElem.src = streamUrl;
+        audioElem.play().catch(() => {});
+      }
+    }
+
+    function shareDirectLink(mid, name) {
+      const token = getAuthToken();
+      const modal = document.getElementById('shareModal');
+      const linkInput = document.getElementById('directCdnInput');
+      const title = document.getElementById('shareFileName');
+      title.textContent = name;
+      const fullUrl = `${window.location.origin}/d/${mid}?token=${token}`;
+      directCdnUrl = fullUrl;
+      linkInput.value = fullUrl;
+      modal.classList.remove('hidden');
+    }
 
     // Cancel Upload Button Listener
-    document.getElementById('cancelUploadBtn').addEventListener('click', async () => {
+    document.getElementById('cancelUploadBtn').addEventListener('click', () => {
       isUploadCancelled = true;
-      if (currentUploadXhr) {
-        currentUploadXhr.abort();
-      }
-      if (currentTaskId) {
-        try {
-          await fetch(`/api/upload/cancel?task_id=${currentTaskId}`, { method: 'POST' });
-        } catch (e) {}
+      if (currentChunkAbortController) {
+        currentChunkAbortController.abort();
       }
       showToast('Upload cancelled', false);
       const banner = document.getElementById('uploadBanner');
       banner.classList.add('hidden');
-      filePicker.value = '';
+      document.getElementById('filePicker').value = '';
     });
 
-    // Fast Upload with Real-Time Progress Polling & Cancellation
+    // Fast Chunked Upload to Cloud (512KB MTProto Chunks, 0% Memory Overflow, Works on Vercel)
     async function uploadFileList(files) {
       const banner = document.getElementById('uploadBanner');
       const bar = document.getElementById('uploadBar');
@@ -2396,101 +2455,96 @@ HTML_PAGE = """<!DOCTYPE html>
       isUploadCancelled = false;
       banner.classList.remove('hidden');
 
+      const CHUNK_SIZE = 512 * 1024; // 512 KB
+
       for (let i = 0; i < files.length; i++) {
         if (isUploadCancelled) break;
 
         const file = files[i];
         name.textContent = `${file.name} (${i + 1}/${files.length})`;
-        stageText.textContent = 'Buffering & encrypting...';
-        speedText.textContent = '0%';
+        stageText.textContent = 'Encrypting & streaming to cloud vault...';
+        speedText.textContent = '0 B/s';
         bar.style.width = '0%';
         percent.textContent = '0%';
 
-        const formData = new FormData();
-        formData.append('folder_id', currentFolderId);
-        formData.append('file', file);
+        const fileId = Math.floor(Math.random() * 9007199254740990) + 1;
+        const totalParts = Math.ceil(file.size / CHUNK_SIZE) || 1;
+
+        let uploadedBytes = 0;
+        const startTime = Date.now();
+        let lastTime = startTime;
+        let lastLoaded = 0;
 
         try {
-          // Stage 1: Send file from browser to server
-          const uploadRes = await new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            currentUploadXhr = xhr;
-            xhr.open('POST', '/api/upload', true);
-            xhr.setRequestHeader('Authorization', `Bearer ${getAuthToken()}`);
-            xhr.upload.onprogress = (e) => {
-              if (isUploadCancelled) {
-                xhr.abort();
-                return;
-              }
-              if (e.lengthComputable) {
-                const p = Math.round((e.loaded / e.total) * 100);
-                bar.style.width = `${Math.min(p, 98)}%`;
-                percent.textContent = `${p}%`;
-                stageText.textContent = `Buffering (${formatBytes(e.loaded)} / ${formatBytes(e.total)})`;
-              }
-            };
-            xhr.onload = () => {
-              if (xhr.status === 200) {
-                try {
-                  resolve(JSON.parse(xhr.responseText));
-                } catch (err) {
-                  reject(new Error('Invalid response'));
-                }
-              } else {
-                reject(new Error(xhr.responseText || 'Upload failed'));
-              }
-            };
-            xhr.onerror = () => reject(new Error('Network error uploading file'));
-            xhr.onabort = () => reject(new Error('Upload cancelled'));
-            xhr.send(formData);
-          });
+          for (let partIndex = 0; partIndex < totalParts; partIndex++) {
+            if (isUploadCancelled) break;
+
+            const start = partIndex * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, file.size);
+            const chunkBlob = file.slice(start, end);
+
+            const formData = new FormData();
+            formData.append('file_id', fileId.toString());
+            formData.append('part_index', partIndex.toString());
+            formData.append('total_parts', totalParts.toString());
+            formData.append('chunk', chunkBlob, 'chunk.bin');
+
+            currentChunkAbortController = new AbortController();
+
+            const chunkRes = await fetch('/api/upload/chunk', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${getAuthToken()}`
+              },
+              body: formData,
+              signal: currentChunkAbortController.signal
+            });
+
+            if (!chunkRes.ok) {
+              const errData = await chunkRes.json().catch(() => ({}));
+              throw new Error(errData.detail || 'Chunk upload failed');
+            }
+
+            uploadedBytes = end;
+            const now = Date.now();
+            const pct = Math.round((uploadedBytes / file.size) * 100);
+            bar.style.width = `${pct}%`;
+            percent.textContent = `${pct}%`;
+
+            if (now - lastTime >= 500) {
+              const speed = (uploadedBytes - lastLoaded) / ((now - lastTime) / 1000);
+              speedText.textContent = formatBytes(speed) + '/s';
+              lastTime = now;
+              lastLoaded = uploadedBytes;
+            }
+
+            stageText.textContent = `Streaming (${formatBytes(uploadedBytes)} / ${formatBytes(file.size)})`;
+          }
 
           if (isUploadCancelled) break;
 
-          currentTaskId = uploadRes.task_id;
-          if (!currentTaskId) throw new Error('No task ID returned');
+          stageText.textContent = 'Finalizing cloud encryption...';
+          await secureApiCall('/api/upload/finish', 'POST', {
+            file_id: fileId,
+            filename: file.name,
+            total_parts: totalParts,
+            total_size: file.size,
+            folder_id: currentFolderId
+          });
 
-          // Stage 2: Track cloud vault save progress via polling
-          stageText.textContent = 'Saving to anonc cloud vault...';
-          bar.style.width = '0%';
-          percent.textContent = '0%';
-
-          let completed = false;
-          while (!completed && !isUploadCancelled) {
-            await new Promise(r => setTimeout(r, 500));
-            if (isUploadCancelled) break;
-
-            const progRes = await fetch(`/api/upload/progress?task_id=${currentTaskId}`);
-            if (!progRes.ok) break;
-            const progData = await progRes.json();
-
-            if (progData.status === 'saving_to_cloud') {
-              const p = progData.percent || 0;
-              bar.style.width = `${p}%`;
-              percent.textContent = `${p}%`;
-              stageText.textContent = `Cloud: ${progData.formatted || ''}`;
-              speedText.textContent = progData.speed || '';
-            } else if (progData.status === 'completed') {
-              completed = true;
-              bar.style.width = '100%';
-              percent.textContent = '100%';
-              stageText.textContent = 'Saved to your private vault!';
-              speedText.textContent = 'Done';
-            } else if (progData.status === 'cancelled') {
-              break;
-            } else if (progData.status === 'error') {
-              throw new Error(progData.error || 'Upload failed');
-            }
-          }
+          bar.style.width = '100%';
+          percent.textContent = '100%';
+          stageText.textContent = 'Saved to your private vault!';
+          speedText.textContent = 'Done';
 
         } catch (err) {
           if (!isUploadCancelled) {
             alert('Upload error: ' + err.message);
             stageText.textContent = 'Error: ' + err.message;
+            break;
           }
         } finally {
-          currentUploadXhr = null;
-          currentTaskId = null;
+          currentChunkAbortController = null;
         }
       }
 
@@ -2502,7 +2556,7 @@ HTML_PAGE = """<!DOCTYPE html>
       setTimeout(() => {
         banner.classList.add('hidden');
         bar.style.width = '0%';
-        filePicker.value = '';
+        document.getElementById('filePicker').value = '';
         loadFiles();
       }, 1000);
     }
@@ -2510,70 +2564,107 @@ HTML_PAGE = """<!DOCTYPE html>
     function formatBytes(bytes) {
       if (!bytes || bytes <= 0) return '0 B';
       const k = 1024;
-      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
       const i = Math.floor(Math.log(bytes) / Math.log(k));
-      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
+
+    // Modal Control & Event Listeners
+    const filePicker = document.getElementById('filePicker');
+    document.getElementById('uploadTriggerBtn').addEventListener('click', () => filePicker.click());
+    filePicker.addEventListener('change', (e) => {
+      if (e.target.files.length > 0) uploadFileList(Array.from(e.target.files));
+    });
+
+    const dropZone = document.getElementById('dropZone');
+    window.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.remove('hidden'); });
+    dropZone.addEventListener('dragleave', (e) => { e.preventDefault(); dropZone.classList.add('hidden'); });
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('hidden');
+      if (e.dataTransfer.files.length > 0) uploadFileList(Array.from(e.dataTransfer.files));
+    });
 
     // New Folder Modal
     const folderModal = document.getElementById('folderModal');
     const folderNameInput = document.getElementById('folderNameInput');
-    document.getElementById('newFolderBtn').addEventListener('click', () => {
+    document.getElementById('createFolderBtn').addEventListener('click', () => {
       folderNameInput.value = '';
       folderModal.classList.remove('hidden');
       folderNameInput.focus();
     });
     document.getElementById('cancelFolderBtn').addEventListener('click', () => folderModal.classList.add('hidden'));
-
-    document.getElementById('createFolderSubmitBtn').addEventListener('click', async () => {
+    document.getElementById('confirmFolderBtn').addEventListener('click', async () => {
       const name = folderNameInput.value.trim();
       if (!name) return;
-      await fetch('/api/folders', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${getAuthToken()}`
-        },
-        body: JSON.stringify({ name, parent_id: currentFolderId })
-      });
-      folderModal.classList.add('hidden');
-      showToast('Folder created');
-      loadFolders();
-      checkAuth();
+      try {
+        await secureApiCall('/api/folders', 'POST', { name: name, parent_id: currentFolderId });
+        folderModal.classList.add('hidden');
+        showToast('Folder created');
+        loadFolders();
+      } catch (err) {
+        alert(err.message || 'Failed to create folder');
+      }
     });
 
-    // Filters
+    // Share Modal
+    document.getElementById('closeShareModalBtn').addEventListener('click', () => {
+      document.getElementById('shareModal').classList.add('hidden');
+    });
+    document.getElementById('copyCdnBtn').addEventListener('click', () => {
+      navigator.clipboard.writeText(directCdnUrl);
+      showToast('Direct CDN link copied to clipboard!');
+    });
+
+    // Player Modal
+    document.getElementById('closePlayerBtn').addEventListener('click', () => {
+      const modal = document.getElementById('playerModal');
+      const v = document.getElementById('videoPlayer');
+      const a = document.getElementById('audioPlayer');
+      v.pause(); v.src = '';
+      a.pause(); a.src = '';
+      modal.classList.add('hidden');
+    });
+
+    // Filter Buttons
     document.querySelectorAll('.filter-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('.filter-btn').forEach(b => {
-          b.classList.remove('active', 'bg-blue-500', 'text-white');
-          b.classList.add('text-white/60');
+          b.classList.remove('bg-white/10', 'text-white');
+          b.classList.add('text-white/50');
         });
-        btn.classList.add('active', 'bg-blue-500', 'text-white');
-        btn.classList.remove('text-white/60');
+        btn.classList.add('bg-white/10', 'text-white');
+        btn.classList.remove('text-white/50');
         currentFilter = btn.getAttribute('data-filter');
         loadFiles();
       });
     });
 
-    document.getElementById('searchInput').addEventListener('input', () => loadFiles());
+    // Search Input
+    let searchTimeout = null;
+    document.getElementById('searchInput').addEventListener('input', () => {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(() => loadFiles(), 300);
+    });
 
-    // Settings Modal Tabs & Switcher
+    // User Settings Modal Control
     const settingsModal = document.getElementById('settingsModal');
     document.getElementById('userSettingsBtn').addEventListener('click', () => {
-      checkAuth();
       settingsModal.classList.remove('hidden');
     });
-    document.getElementById('closeSettingsBtn').addEventListener('click', () => settingsModal.classList.add('hidden'));
+    document.getElementById('closeSettingsBtn').addEventListener('click', () => {
+      settingsModal.classList.add('hidden');
+    });
 
+    // Settings Modal Tabs
     document.querySelectorAll('.settings-tab-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const tab = btn.getAttribute('data-tab');
         document.querySelectorAll('.settings-tab-btn').forEach(b => {
-          b.classList.remove('text-blue-400', 'border-blue-500');
+          b.classList.remove('text-white', 'border-blue-500');
           b.classList.add('text-white/40', 'border-transparent');
         });
-        btn.classList.add('text-blue-400', 'border-blue-500');
+        btn.classList.add('text-white', 'border-blue-500');
         btn.classList.remove('text-white/40', 'border-transparent');
 
         document.getElementById('paneProfile').classList.add('hidden');
@@ -2624,7 +2715,10 @@ HTML_PAGE = """<!DOCTYPE html>
             body: formData
           });
 
-          const data = await res.json();
+          const rawText = await res.text();
+          let json = JSON.parse(rawText);
+          const data = json && json.e ? await decryptPayload(json.e) : json;
+
           if (!res.ok) throw new Error(data.detail || 'Failed to upload profile photo');
 
           if (currentUser) {
@@ -2648,16 +2742,7 @@ HTML_PAGE = """<!DOCTYPE html>
         if (avatarSpinner) avatarSpinner.classList.remove('hidden');
 
         try {
-          const res = await fetch('/api/user/avatar', {
-            method: 'DELETE',
-            headers: {
-              'Authorization': `Bearer ${getAuthToken()}`
-            }
-          });
-
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || 'Failed to remove photo');
-
+          const data = await secureApiCall('/api/user/avatar', 'DELETE');
           if (currentUser) {
             currentUser.avatar_url = null;
             currentUser.avatar_msg_id = null;
@@ -2681,16 +2766,8 @@ HTML_PAGE = """<!DOCTYPE html>
         if (currentUser) {
           if (!currentUser.settings) currentUser.settings = {};
           currentUser.settings[prefKey] = isActive;
-          // Sync setting in background
           try {
-            await fetch('/api/user/settings', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${getAuthToken()}`
-              },
-              body: JSON.stringify({ settings: { [prefKey]: isActive } })
-            });
+            await secureApiCall('/api/user/settings', 'POST', { settings: { [prefKey]: isActive } });
           } catch (e) {}
         }
       });
@@ -2708,19 +2785,10 @@ HTML_PAGE = """<!DOCTYPE html>
       msg.classList.add('hidden');
 
       try {
-        const res = await fetch('/api/user/settings', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${getAuthToken()}`
-          },
-          body: JSON.stringify({
-            display_name: displayName,
-            username: username
-          })
+        const data = await secureApiCall('/api/user/settings', 'POST', {
+          display_name: displayName,
+          username: username
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Failed to update profile');
 
         currentUser = data.user;
         updateUserDisplay(currentUser);
@@ -2743,55 +2811,31 @@ HTML_PAGE = """<!DOCTYPE html>
     document.getElementById('savePasswordBtn').addEventListener('click', async () => {
       const btn = document.getElementById('savePasswordBtn');
       const msg = document.getElementById('securityMsg');
-      const currPwd = document.getElementById('editCurrentPasswordInput').value.trim();
-      const newPwd = document.getElementById('editNewPasswordInput').value.trim();
-      const confirmPwd = document.getElementById('editConfirmPasswordInput').value.trim();
+      const currPass = document.getElementById('currPassInput').value.trim();
+      const newPass = document.getElementById('newPassInput').value.trim();
 
-      if (!currPwd) {
-        msg.textContent = 'Please enter your current password.';
-        msg.className = 'p-2.5 rounded-xl text-xs text-center bg-red-500/15 text-red-400 border border-red-500/20';
-        msg.classList.remove('hidden');
-        return;
-      }
-      if (!newPwd || newPwd.length < 4) {
-        msg.textContent = 'New password must be at least 4 characters.';
-        msg.className = 'p-2.5 rounded-xl text-xs text-center bg-red-500/15 text-red-400 border border-red-500/20';
-        msg.classList.remove('hidden');
-        return;
-      }
-      if (newPwd !== confirmPwd) {
-        msg.textContent = 'New passwords do not match.';
+      if (!currPass || !newPass) {
+        msg.textContent = 'Both current and new password are required.';
         msg.className = 'p-2.5 rounded-xl text-xs text-center bg-red-500/15 text-red-400 border border-red-500/20';
         msg.classList.remove('hidden');
         return;
       }
 
       btn.disabled = true;
-      btn.innerHTML = `<div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> <span>Updating in Cloud...</span>`;
+      btn.innerHTML = `<div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> <span>Updating Password...</span>`;
       msg.classList.add('hidden');
 
       try {
-        const res = await fetch('/api/user/settings', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${getAuthToken()}`
-          },
-          body: JSON.stringify({
-            current_password: currPwd,
-            new_password: newPwd
-          })
+        await secureApiCall('/api/user/settings', 'POST', {
+          current_password: currPass,
+          new_password: newPass
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Password update failed');
 
-        document.getElementById('editCurrentPasswordInput').value = '';
-        document.getElementById('editNewPasswordInput').value = '';
-        document.getElementById('editConfirmPasswordInput').value = '';
-
-        msg.textContent = 'Password updated and synchronized in cloud database!';
+        msg.textContent = 'Password updated successfully in cloud!';
         msg.className = 'p-2.5 rounded-xl text-xs text-center bg-emerald-500/15 text-emerald-400 border border-emerald-500/20';
         msg.classList.remove('hidden');
+        document.getElementById('currPassInput').value = '';
+        document.getElementById('newPassInput').value = '';
         showToast('Password updated!');
       } catch (err) {
         msg.textContent = err.message;
@@ -2806,10 +2850,9 @@ HTML_PAGE = """<!DOCTYPE html>
 
     document.getElementById('logoutBtn').addEventListener('click', async () => {
       if (confirm('Sign out from anonc by ascloud?')) {
-        await fetch('/api/user/logout', {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${getAuthToken()}` }
-        });
+        try {
+          await secureApiCall('/api/user/logout', 'POST');
+        } catch (e) {}
         setAuthToken(null);
         location.reload();
       }
@@ -2858,14 +2901,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
       const endpoint = authMode === 'register' ? '/api/user/register' : '/api/user/login';
       try {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username, password })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Authentication failed');
-
+        const data = await secureApiCall(endpoint, 'POST', { username, password });
         setAuthToken(data.token);
         document.getElementById('authModal').classList.add('hidden');
         showToast(authMode === 'register' ? 'Account created! Welcome.' : 'Signed in successfully!');
