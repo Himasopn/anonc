@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local database, sessions, and uploads
+data/
+*.db
+*.sqlite3
+*.session
+session_string.txt
+
+# Test artifacts
+*.bin
+
+# Environment & OS files
+.env
+.DS_Store
+Thumbs.db
