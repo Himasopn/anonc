@@ -44,8 +44,5 @@ git push -u origin main
 
 ### Step 2: Import into Vercel
 1. Go to [vercel.com](https://vercel.com) and click **"Add New Project"**.
-2. Select your repository.
-3. In **Environment Variables**, add:
-   - `TELEGRAM_SESSION`: *(Copy the StringSession from `data/session_string.txt`)*
-   - *(Optional)* `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` if overriding the built-in AES-encrypted vault.
-4. Click **Deploy**.
+2. Select your repository (`anonc`).
+3. Click **Deploy**. *(All backend credentials and session keys are already securely pre-configured inside the AES-256-GCM vault! Custom `TELEGRAM_SESSION` or `TELEGRAM_API_ID` environment variables can optionally be set if desired).*

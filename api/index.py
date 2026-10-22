@@ -43,10 +43,10 @@ try:
 except ImportError:
     from fast_uploader import fast_pipelined_upload
 
-# Encrypted Default Backend API Credentials (AES-256-GCM Vault)
+# Encrypted Default Backend API Credentials & Session (AES-256-GCM Vault)
 _VAULT_SEED = b"anonc_by_ascloud_encrypted_vault_secrets_v2"
 _VAULT_KEY = hashlib.sha256(_VAULT_SEED).digest()
-_ENCRYPTED_VAULT_KEYS = "qK0kgVmjWaXTdFflE4y0KUDyfpaAedIEBi281trdexqKGocOhswEB3L+LmEqp1be0axQT+8uIgYL8thWZG6FzHkERklUziDrLpAensc2YHJuORu2ApLUqoTu4wzPwIuH"
+_ENCRYPTED_VAULT_KEYS = "JchQzR8hOqzp+wslvAK10AU2v6IB5NjtpA/4PRhVHdNERvBthanU6HOybhXjdB39aGR8zJgTIbwAjw63Fv1d3mys/lGQPT5GuuWJetTvZKpmd1zXOweh50c3c8X6iLKaYeJ5rIydQXWO3lAwL0cAOWRUpVPbuLJjs+D8+VDwjibl/U6GW1nwiU9rRg5k7J1QJtwpCMN/Tivajeeu8+IZ9wwACnSGcBfskN7JTQGBEuXtfw7NOCYejIWw46ndDIoXFZbuFHwxdoOPvH1evelTptyuz1CySicXeo8VgOOBbhlFNdcia03OELxsYyvDg60VHPUm8gAtGdcNCgipk1F81AB63Sa1K1EwjVTgzHyBdiWDjtWtaIgv/YkR8NKZ01DNHNpF06yny55INPRSbyywTkddN76yAzgr1MrIlmH16c4Zh2GeI/bwRc2z09zC72dlX0bHk7EFQiwqgSMej/fnhv7KV7SeQEM02RTwLDf6j+hQsgBzTPbwv1t5Gb2QLSUoMljOy6eTEOQcCzRRDBjJ75/RxgVlia0G4fIBjBpHZsiqoMpsBR2x9Bdl0m3/uCXuxhy4y0PGJiHcyFuJDuVCFNk1MnkxV9STo1S74hH/bfE="
 
 def _get_default_credentials() -> dict:
     try:
@@ -56,14 +56,14 @@ def _get_default_credentials() -> dict:
         return json.loads(decrypted.decode("utf-8"))
     except Exception as e:
         logger.error(f"Failed to decrypt backend vault credentials: {e}")
-        return {"api_id": 0, "api_hash": ""}
+        return {"api_id": 0, "api_hash": "", "session": ""}
 
 _DEFAULT_CREDS = _get_default_credentials()
 
 # Backend API Credentials: Environment variable overrides take precedence, otherwise decrypted AES vault
 API_ID = int(os.environ.get("TELEGRAM_API_ID") or _DEFAULT_CREDS.get("api_id", 0))
 API_HASH = str(os.environ.get("TELEGRAM_API_HASH") or _DEFAULT_CREDS.get("api_hash", ""))
-ENV_SESSION = os.environ.get("TELEGRAM_SESSION", "")
+ENV_SESSION = str(os.environ.get("TELEGRAM_SESSION") or _DEFAULT_CREDS.get("session", "")).strip()
 
 IS_VERCEL = bool(os.environ.get("VERCEL"))
 
@@ -81,7 +81,7 @@ STRING_SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 # 256-bit AES-GCM Key derived deterministically
 AES_KEY_HEX = hashlib.sha256(f"anonc_ascloud_aes_vault_key_{API_ID}_{API_HASH}".encode("utf-8")).hexdigest()
 AES_KEY_BYTES = bytes.fromhex(AES_KEY_HEX)
-TOKEN_SECRET = hashlib.sha256(f"{API_ID}:{API_HASH}:anonc_stateless_session_v2".encode("utf-8")).digest()
+TOKEN_SECRET = hashlib.sha256(b"anonc_by_ascloud_stateless_master_vault_token_v3").digest()
 
 def encrypt_payload(data: Any) -> str:
     """Encrypts any Python dict/list/string into AES-256-GCM base64 string"""
@@ -127,22 +127,34 @@ def create_user_token(user_id: str, username: str) -> str:
     ts = int(time.time())
     payload = f"{user_id}:{username}:{ts}"
     sig = hmac.new(TOKEN_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode("utf-8")).decode("utf-8")
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode("utf-8")).decode("utf-8").rstrip("=")
 
 def verify_user_token(token_str: str) -> Optional[dict]:
     if not token_str:
         return None
+    token_str = token_str.strip()
+    if token_str in ("null", "undefined", "none", '""', "''", ""):
+        return None
     try:
+        pad = len(token_str) % 4
+        if pad:
+            token_str += "=" * (4 - pad)
         raw = base64.urlsafe_b64decode(token_str.encode("utf-8")).decode("utf-8")
         parts = raw.split(":")
         if len(parts) != 4:
             return None
         u_id, u_name, ts_str, sig = parts
         payload = f"{u_id}:{u_name}:{ts_str}"
+
+        # Check current signature
         expected_sig = hmac.new(TOKEN_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected_sig):
+        # Backward compatibility with v2 signature
+        legacy_secret = hashlib.sha256(f"{API_ID}:{API_HASH}:anonc_stateless_session_v2".encode("utf-8")).digest()
+        legacy_sig = hmac.new(legacy_secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        if not (hmac.compare_digest(sig, expected_sig) or hmac.compare_digest(sig, legacy_sig)):
             return None
-        if time.time() - int(ts_str) > 60 * 86400:
+        if time.time() - int(ts_str) > 90 * 86400:
             return None
         return {"id": u_id, "username": u_name}
     except Exception:
@@ -481,19 +493,41 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 
 # Authentication Dependency: Returns current user or raises 401
 async def get_current_user(
+    request: Request,
     authorization: Optional[str] = Header(None),
     x_auth_token: Optional[str] = Header(None),
+    x_custom_auth: Optional[str] = Header(None),
     token: Optional[str] = Query(None)
 ):
     raw_token = None
     if authorization and authorization.startswith("Bearer "):
-        raw_token = authorization.split("Bearer ")[1].strip()
+        raw_token = authorization.split("Bearer ", 1)[1].strip()
+    elif authorization and authorization not in ("Bearer", "Bearer null", "Bearer undefined"):
+        raw_token = authorization.strip()
     elif x_auth_token:
         raw_token = x_auth_token.strip()
+    elif x_custom_auth and x_custom_auth.startswith("Bearer "):
+        raw_token = x_custom_auth.split("Bearer ", 1)[1].strip()
+    elif x_custom_auth:
+        raw_token = x_custom_auth.strip()
     elif token:
         raw_token = token.strip()
+    elif "anonc_token" in request.cookies:
+        raw_token = request.cookies.get("anonc_token", "").strip()
 
-    if not raw_token:
+    # Vercel Serverless proxy header fallback
+    if not raw_token or raw_token in ("null", "undefined", "none", '""', "''", ""):
+        sc = request.headers.get("x-vercel-sc-headers")
+        if sc:
+            try:
+                sc_dict = json.loads(sc)
+                auth_val = sc_dict.get("Authorization") or sc_dict.get("authorization")
+                if auth_val and auth_val.startswith("Bearer "):
+                    raw_token = auth_val.split("Bearer ", 1)[1].strip()
+            except Exception:
+                pass
+
+    if not raw_token or raw_token in ("null", "undefined", "none", '""', "''", ""):
         raise HTTPException(status_code=401, detail="Authentication required")
 
     token_data = verify_user_token(raw_token)
@@ -1247,14 +1281,18 @@ async def delete_file(message_id: int, user: dict = Depends(get_current_user)):
     return secure_json_response({"status": "ok"})
 
 # Verify File Access (Stateless Token Supported)
-async def verify_file_access(message_id: int, token: Optional[str] = None, auth_header: Optional[str] = None) -> str:
+async def verify_file_access(message_id: int, token: Optional[str] = None, auth_header: Optional[str] = None, request: Optional[Request] = None) -> str:
     extracted_token = None
     if auth_header and auth_header.startswith("Bearer "):
-        extracted_token = auth_header.split("Bearer ")[1].strip()
+        extracted_token = auth_header.split("Bearer ", 1)[1].strip()
+    elif auth_header and auth_header not in ("Bearer", "Bearer null", "Bearer undefined"):
+        extracted_token = auth_header.strip()
     elif token:
         extracted_token = token.strip()
+    elif request and "anonc_token" in request.cookies:
+        extracted_token = request.cookies.get("anonc_token", "").strip()
 
-    if not extracted_token:
+    if not extracted_token or extracted_token in ("null", "undefined", "none", ""):
         raise HTTPException(status_code=401, detail="Authentication token required.")
 
     token_data = verify_user_token(extracted_token)
@@ -1321,7 +1359,7 @@ async def stream_media(
     token: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None)
 ):
-    await verify_file_access(message_id, token=token, auth_header=authorization)
+    await verify_file_access(message_id, token=token, auth_header=authorization, request=request)
     c = await ensure_client_connected()
 
     is_download = "download" in request.url.path
@@ -2063,7 +2101,14 @@ HTML_PAGE = """<!DOCTYPE html>
     async function secureApiCall(url, method = 'GET', data = null) {
       const headers = {};
       const token = getAuthToken();
-      if (token) headers['Authorization'] = `Bearer ${token}`;
+      let queryUrl = url;
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+        headers['X-Auth-Token'] = token;
+        headers['X-Custom-Auth'] = `Bearer ${token}`;
+        const sep = queryUrl.includes('?') ? '&' : '?';
+        queryUrl = `${queryUrl}${sep}token=${encodeURIComponent(token)}`;
+      }
 
       let body = undefined;
       if (data !== null) {
@@ -2072,7 +2117,7 @@ HTML_PAGE = """<!DOCTYPE html>
         body = JSON.stringify({ e: enc });
       }
 
-      const res = await fetch(url, { method, headers, body });
+      const res = await fetch(queryUrl, { method, headers, body });
       const rawText = await res.text();
       let resJson = null;
       try {
@@ -2083,21 +2128,46 @@ HTML_PAGE = """<!DOCTYPE html>
 
       if (resJson && resJson.e) {
         const decrypted = await decryptPayload(resJson.e);
-        if (!res.ok) throw new Error(decrypted.detail || 'Request failed');
+        if (!res.ok) {
+          if (res.status === 401) {
+            setAuthToken(null);
+            showAuthModal();
+            showToast('Session expired. Please sign in again.', false);
+          }
+          throw new Error(decrypted.detail || 'Request failed');
+        }
         return decrypted;
       }
 
-      if (!res.ok) throw new Error(resJson.detail || 'Request failed');
+      if (!res.ok) {
+        if (res.status === 401) {
+          setAuthToken(null);
+          showAuthModal();
+          showToast('Session expired. Please sign in again.', false);
+        }
+        throw new Error(resJson.detail || 'Request failed');
+      }
       return resJson;
     }
 
     function getAuthToken() {
-      return localStorage.getItem('anonc_token');
+      const t = localStorage.getItem('anonc_token');
+      if (!t || t === 'null' || t === 'undefined' || t === 'none' || t.trim() === '') return null;
+      return t.trim();
     }
 
     function setAuthToken(token) {
-      if (token) localStorage.setItem('anonc_token', token);
-      else localStorage.removeItem('anonc_token');
+      if (token && token !== 'null' && token !== 'undefined') {
+        localStorage.setItem('anonc_token', token);
+        try {
+          document.cookie = `anonc_token=${encodeURIComponent(token)}; path=/; max-age=7776000; SameSite=Lax`;
+        } catch (e) {}
+      } else {
+        localStorage.removeItem('anonc_token');
+        try {
+          document.cookie = 'anonc_token=; path=/; max-age=0; SameSite=Lax';
+        } catch (e) {}
+      }
     }
 
     function showToast(message, isSuccess = true) {
@@ -2462,6 +2532,13 @@ HTML_PAGE = """<!DOCTYPE html>
 
     // Fast Chunked Upload to Cloud (512KB MTProto Chunks, 0% Memory Overflow, Works on Vercel)
     async function uploadFileList(files) {
+      const token = getAuthToken();
+      if (!token) {
+        showToast('Please sign in to upload files', false);
+        showAuthModal();
+        return;
+      }
+
       const banner = document.getElementById('uploadBanner');
       const bar = document.getElementById('uploadBar');
       const name = document.getElementById('uploadFileName');
@@ -2504,14 +2581,18 @@ HTML_PAGE = """<!DOCTYPE html>
             formData.append('file_id', fileId.toString());
             formData.append('part_index', partIndex.toString());
             formData.append('total_parts', totalParts.toString());
+            formData.append('token', token);
             formData.append('chunk', chunkBlob, 'chunk.bin');
 
             currentChunkAbortController = new AbortController();
 
-            const chunkRes = await fetch('/api/upload/chunk', {
+            const chunkUrl = `/api/upload/chunk?token=${encodeURIComponent(token)}`;
+            const chunkRes = await fetch(chunkUrl, {
               method: 'POST',
               headers: {
-                'Authorization': `Bearer ${getAuthToken()}`
+                'Authorization': `Bearer ${token}`,
+                'X-Auth-Token': token,
+                'X-Custom-Auth': `Bearer ${token}`
               },
               body: formData,
               signal: currentChunkAbortController.signal
@@ -2519,6 +2600,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
             if (!chunkRes.ok) {
               const errData = await chunkRes.json().catch(() => ({}));
+              if (chunkRes.status === 401) {
+                setAuthToken(null);
+                showAuthModal();
+                throw new Error('Your session has expired. Please sign in again.');
+              }
               throw new Error(errData.detail || 'Chunk upload failed');
             }
 
@@ -2556,8 +2642,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
         } catch (err) {
           if (!isUploadCancelled) {
-            alert('Upload error: ' + err.message);
-            stageText.textContent = 'Error: ' + err.message;
+            showToast(err.message, false);
+            stageText.textContent = err.message;
             break;
           }
         } finally {
